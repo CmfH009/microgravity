@@ -15,6 +15,7 @@ import (
 	"github.com/CmfH009/microgravity/internal/executor"
 	"github.com/CmfH009/microgravity/internal/mcp"
 	"github.com/CmfH009/microgravity/internal/ollama"
+	"github.com/CmfH009/microgravity/internal/openai"
 	"github.com/CmfH009/microgravity/internal/plan"
 	"github.com/CmfH009/microgravity/internal/pruner"
 	"github.com/CmfH009/microgravity/internal/router"
@@ -83,29 +84,78 @@ type genOutcome struct {
 
 type turnDispatchParams struct {
 	explicitProvider string
+	routingMode      router.RoutingMode
 	activeModel      string
 	localModelName   string
+	localFastModel   string
+	localHeavyModel  string
 	cloudModelName   string
+	openAIBaseURL    string
+	openAIModel      string
+	routeDecision    router.RouteDecision
 	complexity       router.Complexity
 	fullPrompt       string
 	turnImages       []string
 	availableTools   []mcp.Tool
 	ollamaClient     *ollama.Client
+	openAIClient     *openai.Client
 	cloudClient      *cloud.Client
 	sw               *streamingWriter
 }
 
+func selectOpenAIModel(openAIModel, activeModel, localModelName, localFastModel, localHeavyModel string, routingMode router.RoutingMode, decision router.RouteDecision) string {
+	if m := strings.TrimSpace(openAIModel); m != "" {
+		return m
+	}
+	if decision.Complexity == router.ComplexityComplex && strings.TrimSpace(localHeavyModel) != "" {
+		return strings.TrimSpace(localHeavyModel)
+	}
+	if strings.TrimSpace(localFastModel) != "" {
+		return strings.TrimSpace(localFastModel)
+	}
+	if m := strings.TrimSpace(activeModel); m != "" {
+		lower := strings.ToLower(m)
+		if !strings.HasPrefix(lower, "gemini") && lower != "flash" && lower != "pro" {
+			return m
+		}
+	}
+	if routingMode == router.ModeLocalOnly && decision.Model != "" {
+		return decision.Model
+	}
+	if decision.Model != "" {
+		return decision.Model
+	}
+	return localModelName
+}
+
 func generateWithFailover(ctx context.Context, p turnDispatchParams) (genOutcome, error) {
-	callOllama := func() (genOutcome, error) {
+	callOllama := func(modelName string) (genOutcome, error) {
 		if p.ollamaClient == nil {
 			return genOutcome{}, fmt.Errorf("ollama client not initialized")
 		}
-		res, err := p.ollamaClient.GenerateWithTools(ctx, p.localModelName, p.fullPrompt, p.turnImages, p.availableTools, p.sw)
+		if strings.TrimSpace(modelName) == "" {
+			modelName = p.localModelName
+		}
+		res, err := p.ollamaClient.GenerateWithTools(ctx, modelName, p.fullPrompt, p.turnImages, p.availableTools, p.sw)
 		if err != nil {
 			return genOutcome{}, err
 		}
 		if res == nil {
 			return genOutcome{}, fmt.Errorf("ollama returned nil result")
+		}
+		return genOutcome{text: strings.TrimSpace(res.Text), calls: res.ToolCalls}, nil
+	}
+
+	callOpenAI := func(modelName string) (genOutcome, error) {
+		if p.openAIClient == nil {
+			return genOutcome{}, fmt.Errorf("openai client not initialized")
+		}
+		res, err := p.openAIClient.GenerateWithTools(ctx, modelName, p.fullPrompt, p.turnImages, p.availableTools, p.sw)
+		if err != nil {
+			return genOutcome{}, err
+		}
+		if res == nil {
+			return genOutcome{}, fmt.Errorf("openai returned nil result")
 		}
 		return genOutcome{text: strings.TrimSpace(res.Text), calls: res.ToolCalls}, nil
 	}
@@ -124,21 +174,37 @@ func generateWithFailover(ctx context.Context, p turnDispatchParams) (genOutcome
 		return genOutcome{text: strings.TrimSpace(res.Text), calls: res.ToolCalls}, nil
 	}
 
+	// OpenAI-compatible local backend never calls Cloud APIs.
+	if p.explicitProvider == "openai" || strings.TrimSpace(p.openAIBaseURL) != "" {
+		targetModel := selectOpenAIModel(
+			p.openAIModel,
+			p.activeModel,
+			p.localModelName,
+			p.localFastModel,
+			p.localHeavyModel,
+			p.routingMode,
+			p.routeDecision,
+		)
+		return callOpenAI(targetModel)
+	}
+
+	localTarget := p.routeDecision.Model
+	if localTarget == "" {
+		localTarget = p.localModelName
+	}
+
+	// Strict local-only mode never touches Cloud APIs.
+	if p.routingMode == router.ModeLocalOnly {
+		return callOllama(localTarget)
+	}
+
 	switch p.explicitProvider {
 	case "ollama":
-		out, err := callOllama()
-		if err == nil {
-			return out, nil
+		// Explicit ollama provider never falls back to Cloud APIs.
+		if p.localFastModel != "" || p.localHeavyModel != "" {
+			return callOllama(localTarget)
 		}
-		if ctx.Err() != nil {
-			return genOutcome{}, ctx.Err()
-		}
-		p.sw.StopSpinner()
-		outCloud, errCloud := callCloud(p.cloudModelName)
-		if errCloud == nil {
-			return outCloud, nil
-		}
-		return genOutcome{}, fmt.Errorf("ollama failed (%w); cloud fallback failed (%w)", err, errCloud)
+		return callOllama(p.localModelName)
 
 	case "cloud":
 		out, err := callCloud(p.activeModel)
@@ -148,19 +214,26 @@ func generateWithFailover(ctx context.Context, p turnDispatchParams) (genOutcome
 		if ctx.Err() != nil {
 			return genOutcome{}, ctx.Err()
 		}
+		if p.routingMode == router.ModeCloudOnly {
+			return genOutcome{}, err
+		}
 		p.sw.StopSpinner()
-		outLocal, errLocal := callOllama()
+		outLocal, errLocal := callOllama(p.localModelName)
 		if errLocal == nil {
 			return outLocal, nil
 		}
 		return genOutcome{}, fmt.Errorf("cloud failed (%w); ollama fallback failed (%w)", err, errLocal)
 	}
 
-	// Automatic Routing
+	if p.routingMode == router.ModeCloudOnly {
+		return callCloud(p.activeModel)
+	}
+
+	// Automatic Hybrid Routing
 	var ollamaErr error
 	ollamaTried := false
 	if p.complexity == router.ComplexitySimple {
-		out, err := callOllama()
+		out, err := callOllama(localTarget)
 		if err == nil {
 			return out, nil
 		}
@@ -184,7 +257,7 @@ func generateWithFailover(ctx context.Context, p turnDispatchParams) (genOutcome
 	}
 
 	p.sw.StopSpinner()
-	outLocal, errLocal := callOllama()
+	outLocal, errLocal := callOllama(localTarget)
 	if errLocal == nil {
 		return outLocal, nil
 	}
@@ -226,12 +299,18 @@ func (s *Session) ExecuteTurn(ctx context.Context, userInput string, turnImages 
 	s.mu.RLock()
 	activeModel := s.Config.ActiveModel
 	localModelName := s.Config.LocalModelName
+	localFastModel := s.Config.LocalFastModel
+	localHeavyModel := s.Config.LocalHeavyModel
 	cloudModelName := s.Config.CloudModelName
 	explicitProvider := s.Config.ExplicitProvider
+	routingModeRaw := s.Config.RoutingMode
+	openAIBaseURL := s.Config.OpenAIBaseURL
+	openAIModel := s.Config.OpenAIModel
 	cwd := s.Config.Cwd
 	maxTurns := s.Config.MaxTurns
 	exec := s.Config.Executor
 	ollamaClient := s.OllamaClient
+	openAIClient := s.OpenAIClient
 	cloudClient := s.CloudClient
 	routerInst := s.Router
 	verifierInst := s.Verifier
@@ -250,6 +329,23 @@ func (s *Session) ExecuteTurn(ctx context.Context, userInput string, turnImages 
 	}
 	if activeModel == "" {
 		activeModel = cloudModelName
+	}
+
+	var routingMode router.RoutingMode
+	if strings.TrimSpace(routingModeRaw) != "" {
+		routingMode = router.NormalizeRoutingMode(routingModeRaw)
+	} else if envMode, ok := router.RoutingModeFromEnv(); ok {
+		routingMode = envMode
+	} else {
+		routingMode = router.ModeHybrid
+	}
+
+	effectiveLocalFast := strings.TrimSpace(localFastModel)
+	if effectiveLocalFast == "" {
+		effectiveLocalFast = localModelName
+	}
+	if routerInst == nil {
+		routerInst = router.NewRouter()
 	}
 
 	s.mu.Lock()
@@ -281,7 +377,21 @@ func (s *Session) ExecuteTurn(ctx context.Context, userInput string, turnImages 
 		convoStr := s.Conversation.String()
 		s.mu.RUnlock()
 
-		maxModelTokens := pruner.MaxTokensForModel(activeModel)
+		routeDecision := routerInst.SelectRoute(cleanInput, routingMode, effectiveLocalFast, localHeavyModel, activeModel)
+		complexity := routeDecision.Complexity
+
+		budgetModel := activeModel
+		if explicitProvider == "openai" || strings.TrimSpace(openAIBaseURL) != "" {
+			budgetModel = selectOpenAIModel(openAIModel, activeModel, localModelName, localFastModel, localHeavyModel, routingMode, routeDecision)
+		} else if routingMode == router.ModeLocalOnly || explicitProvider == "ollama" || routeDecision.Provider == "ollama" {
+			if routeDecision.Model != "" {
+				budgetModel = routeDecision.Model
+			} else {
+				budgetModel = localModelName
+			}
+		}
+
+		maxModelTokens := pruner.MaxTokensForModel(budgetModel)
 		sysPrompt := s.BuildSystemPrompt()
 		sysTokens := pruner.EstimateTokens(sysPrompt)
 		outputReserve := 4096
@@ -295,10 +405,6 @@ func (s *Session) ExecuteTurn(ctx context.Context, userInput string, turnImages 
 
 		prunedConvo, _ := pruner.PruneContext(convoStr, maxConvoTokens)
 		fullPrompt := sysPrompt + "\n---CONVERSATION---\n" + prunedConvo
-		complexity := router.ComplexityComplex
-		if routerInst != nil {
-			complexity = routerInst.Classify(cleanInput)
-		}
 
 		var spin *spinner.Spinner
 		if writer == nil {
@@ -326,14 +432,21 @@ func (s *Session) ExecuteTurn(ctx context.Context, userInput string, turnImages 
 			defer cancel()
 			out, genErr := generateWithFailover(ctxCancel, turnDispatchParams{
 				explicitProvider: explicitProvider,
+				routingMode:      routingMode,
 				activeModel:      activeModel,
 				localModelName:   localModelName,
+				localFastModel:   localFastModel,
+				localHeavyModel:  localHeavyModel,
 				cloudModelName:   cloudModelName,
+				openAIBaseURL:    openAIBaseURL,
+				openAIModel:      openAIModel,
+				routeDecision:    routeDecision,
 				complexity:       complexity,
 				fullPrompt:       fullPrompt,
 				turnImages:       turnImages,
 				availableTools:   availableTools,
 				ollamaClient:     ollamaClient,
+				openAIClient:     openAIClient,
 				cloudClient:      cloudClient,
 				sw:               sw,
 			})

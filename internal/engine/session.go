@@ -17,6 +17,7 @@ import (
 	"github.com/CmfH009/microgravity/internal/mcp"
 	"github.com/CmfH009/microgravity/internal/memory"
 	"github.com/CmfH009/microgravity/internal/ollama"
+	"github.com/CmfH009/microgravity/internal/openai"
 	"github.com/CmfH009/microgravity/internal/plan"
 	"github.com/CmfH009/microgravity/internal/router"
 	"github.com/CmfH009/microgravity/internal/rules"
@@ -88,6 +89,12 @@ type SessionConfig struct {
 	LoadedRules      *rules.Rules
 	Executor         *executor.Executor
 	ExplicitProvider string
+	RoutingMode      string
+	LocalFastModel   string
+	LocalHeavyModel  string
+	OpenAIBaseURL    string
+	OpenAIAPIKey     string
+	OpenAIModel      string
 	CoreMemory       string
 	MemoryStore      *memory.MemoryStore
 }
@@ -109,6 +116,7 @@ type Session struct {
 	ActivePlan    *plan.Plan
 	TrajLogger    *trajectory.Logger
 	OllamaClient  *ollama.Client
+	OpenAIClient  *openai.Client
 	CloudClient   *cloud.Client
 	Router        *router.Router
 	SubCh         <-chan string
@@ -135,7 +143,20 @@ func NewSession(cfg SessionConfig) (*Session, error) {
 		cfg.Cwd = cwd
 	}
 	if cfg.LocalModelName == "" {
-		cfg.LocalModelName = "gemma:2b"
+		if cfg.LocalFastModel != "" {
+			cfg.LocalModelName = cfg.LocalFastModel
+		} else {
+			cfg.LocalModelName = "gemma:2b"
+		}
+	}
+	if cfg.RoutingMode == "" {
+		if envMode, ok := router.RoutingModeFromEnv(); ok {
+			cfg.RoutingMode = string(envMode)
+		} else {
+			cfg.RoutingMode = string(router.ModeHybrid)
+		}
+	} else {
+		cfg.RoutingMode = string(router.NormalizeRoutingMode(cfg.RoutingMode))
 	}
 	if cfg.CloudModelName == "" {
 		cfg.CloudModelName = "gemini-3.6-flash"
@@ -166,6 +187,7 @@ func NewSession(cfg SessionConfig) (*Session, error) {
 		State:         StateIdle,
 		TrajLogger:    trajLogger,
 		OllamaClient:  ollama.NewClient(cfg.OllamaBaseURL),
+		OpenAIClient:  openai.NewClient(cfg.OpenAIBaseURL, cfg.OpenAIAPIKey),
 		CloudClient:   cloud.NewClient(),
 		Router:        router.NewRouter(),
 		closeCh:       make(chan struct{}),
@@ -274,6 +296,37 @@ func (s *Session) SetState(st ExecutionState) {
 	if s.Config.EventBus != nil {
 		s.Config.EventBus.Publish("session:state", string(st))
 	}
+}
+
+// SetRoutingMode updates the active routing mode thread-safely.
+func (s *Session) SetRoutingMode(mode string) {
+	if s == nil {
+		return
+	}
+	norm := string(router.NormalizeRoutingMode(mode))
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.Config.RoutingMode = norm
+	if norm == string(router.ModeLocalOnly) && s.Config.ExplicitProvider == "cloud" {
+		s.Config.ExplicitProvider = ""
+	}
+}
+
+// GetRoutingMode returns the effective routing mode thread-safely.
+func (s *Session) GetRoutingMode() router.RoutingMode {
+	if s == nil {
+		return router.ModeHybrid
+	}
+	s.mu.RLock()
+	raw := s.Config.RoutingMode
+	s.mu.RUnlock()
+	if strings.TrimSpace(raw) == "" {
+		if envMode, ok := router.RoutingModeFromEnv(); ok {
+			return envMode
+		}
+		return router.ModeHybrid
+	}
+	return router.NormalizeRoutingMode(raw)
 }
 
 func cloneMessage(m Message) Message {

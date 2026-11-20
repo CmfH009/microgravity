@@ -13,6 +13,7 @@ import (
 	"github.com/CmfH009/microgravity/internal/agents"
 	"github.com/CmfH009/microgravity/internal/config"
 	"github.com/CmfH009/microgravity/internal/history"
+	"github.com/CmfH009/microgravity/internal/router"
 	"github.com/CmfH009/microgravity/internal/ui"
 	"github.com/spf13/cobra"
 )
@@ -39,7 +40,91 @@ var (
 	rootSandbox           bool
 	rootDryRun            bool
 	rootTheme             string
+	rootLocal             bool
+	rootRoutingMode       string
+	rootBaseURL           string
+	rootLocalFastModel    string
+	rootLocalHeavyModel   string
 )
+
+func resolveRoutingMode(cfg *config.Config, localFlag bool, routingModeFlag string) string {
+	if localFlag {
+		return string(router.ModeLocalOnly)
+	}
+	if strings.TrimSpace(routingModeFlag) != "" {
+		return string(router.NormalizeRoutingMode(routingModeFlag))
+	}
+	if envMode, ok := router.RoutingModeFromEnv(); ok {
+		return string(envMode)
+	}
+	if cfg != nil && strings.TrimSpace(cfg.RoutingMode) != "" {
+		return string(router.NormalizeRoutingMode(cfg.RoutingMode))
+	}
+	return string(router.ModeHybrid)
+}
+
+func resolveOpenAIBaseURL(cfg *config.Config, baseURLFlag string) string {
+	if strings.TrimSpace(baseURLFlag) != "" {
+		return strings.TrimSpace(baseURLFlag)
+	}
+	if envURL := strings.TrimSpace(os.Getenv("MG_OPENAI_BASE_URL")); envURL != "" {
+		return envURL
+	}
+	if cfg != nil && strings.TrimSpace(cfg.OpenAIBaseURL) != "" {
+		return strings.TrimSpace(cfg.OpenAIBaseURL)
+	}
+	return ""
+}
+
+func resolveOpenAIAPIKey(cfg *config.Config) string {
+	if envKey := strings.TrimSpace(os.Getenv("MG_OPENAI_API_KEY")); envKey != "" {
+		return envKey
+	}
+	if cfg != nil && strings.TrimSpace(cfg.OpenAIAPIKey) != "" {
+		return strings.TrimSpace(cfg.OpenAIAPIKey)
+	}
+	return ""
+}
+
+func resolveLocalTierModels(cfg *config.Config, fastFlag, heavyFlag, fallbackLocal string) (string, string) {
+	fast := strings.TrimSpace(fastFlag)
+	if fast == "" {
+		fast = strings.TrimSpace(os.Getenv("MG_LOCAL_FAST_MODEL"))
+	}
+	if fast == "" && cfg != nil {
+		fast = strings.TrimSpace(cfg.LocalFastModel)
+	}
+	if fast == "" {
+		fast = strings.TrimSpace(fallbackLocal)
+	}
+
+	heavy := strings.TrimSpace(heavyFlag)
+	if heavy == "" {
+		heavy = strings.TrimSpace(os.Getenv("MG_LOCAL_HEAVY_MODEL"))
+	}
+	if heavy == "" && cfg != nil {
+		heavy = strings.TrimSpace(cfg.LocalHeavyModel)
+	}
+	return fast, heavy
+}
+
+func shouldSkipCloudAuth(cfg *config.Config, localFlag bool, routingModeFlag, baseURLFlag string) bool {
+	if localFlag {
+		return true
+	}
+	if resolveRoutingMode(cfg, localFlag, routingModeFlag) == string(router.ModeLocalOnly) {
+		return true
+	}
+	if resolveOpenAIBaseURL(cfg, baseURLFlag) != "" {
+		return true
+	}
+	return false
+}
+
+func isCloudModelID(modelID string) bool {
+	lower := strings.ToLower(strings.TrimSpace(modelID))
+	return strings.HasPrefix(lower, "gemini-") || lower == "flash" || lower == "pro"
+}
 
 var rootCmd = &cobra.Command{
 	Use:   "microgravity [flags]",
@@ -56,6 +141,8 @@ driven by local (Ollama/Gemma) and cloud-routed (Gemini/Gemma) LLM model archite
 		// Apply theme early so all subsequent UI rendering uses it
 		if rootTheme != "" {
 			ui.SetTheme(rootTheme)
+		} else if savedTheme := config.GetTheme(); savedTheme != "" {
+			ui.SetTheme(savedTheme)
 		}
 
 		if rootAgent != "" {
@@ -104,8 +191,10 @@ driven by local (Ollama/Gemma) and cloud-routed (Gemini/Gemma) LLM model archite
 		}
 
 		cfg, err := config.LoadConfig()
-		if err != nil || cfg.Token == nil || cfg.Token.AccessToken == "" || cfg.AutoAPIKey == "" {
-			authCmd.Run(cmd, args)
+		if !shouldSkipCloudAuth(cfg, rootLocal, rootRoutingMode, rootBaseURL) {
+			if err != nil || cfg.Token == nil || cfg.Token.AccessToken == "" || cfg.AutoAPIKey == "" {
+				authCmd.Run(cmd, args)
+			}
 		}
 
 		chatCmd.Run(cmd, args)
@@ -120,27 +209,55 @@ func executePrintMode(prompt string) {
 		defer cancel()
 	}
 
+	cfg, _ := config.LoadConfig()
 	activeID := config.GetActiveModel()
 	if rootModel != "" {
 		activeID = rootModel
 	}
 
-	opts := SessionOptions{
-		SessionName:  sessionName,
-		ActiveModel:  activeID,
-		Mode:         rootMode,
-		Effort:       rootEffort,
-		AutoApprove:  rootDangerouslySkip || true,
-		DisableSlash: rootDisableSlash,
-		AddDirs:      rootAddDirs,
-		Sandbox:      rootSandbox,
-		DryRun:       rootDryRun,
+	routingMode := resolveRoutingMode(cfg, rootLocal, rootRoutingMode)
+	openAIBaseURL := resolveOpenAIBaseURL(cfg, rootBaseURL)
+	openAIAPIKey := resolveOpenAIAPIKey(cfg)
+	localFast, localHeavy := resolveLocalTierModels(cfg, rootLocalFastModel, rootLocalHeavyModel, "")
+	openAIModel := ""
+	if cfg != nil {
+		openAIModel = strings.TrimSpace(cfg.OpenAIModel)
 	}
 
-	if strings.HasPrefix(activeID, "orbit-") || strings.HasPrefix(activeID, "gemma") || strings.Contains(activeID, ":") {
+	opts := SessionOptions{
+		SessionName:     sessionName,
+		ActiveModel:     activeID,
+		Mode:            rootMode,
+		Effort:          rootEffort,
+		AutoApprove:     rootDangerouslySkip || true,
+		DisableSlash:    rootDisableSlash,
+		AddDirs:         rootAddDirs,
+		Sandbox:         rootSandbox,
+		DryRun:          rootDryRun,
+		RoutingMode:     routingMode,
+		LocalFastModel:  localFast,
+		LocalHeavyModel: localHeavy,
+		OpenAIBaseURL:   openAIBaseURL,
+		OpenAIAPIKey:    openAIAPIKey,
+		OpenAIModel:     openAIModel,
+	}
+
+	if openAIBaseURL != "" {
+		opts.ExplicitProvider = "openai"
+		if rootModel != "" {
+			opts.OpenAIModel = rootModel
+		}
+	} else if routingMode == string(router.ModeLocalOnly) {
+		if rootModel != "" && !isCloudModelID(rootModel) {
+			opts.LocalModelName = rootModel
+			if opts.LocalFastModel == "" {
+				opts.LocalFastModel = rootModel
+			}
+		}
+	} else if strings.HasPrefix(activeID, "orbit-") || strings.HasPrefix(activeID, "gemma") || strings.Contains(activeID, ":") {
 		opts.LocalModelName = activeID
 		opts.ExplicitProvider = "ollama"
-	} else if strings.HasPrefix(activeID, "gemini-") || activeID == "flash" || activeID == "pro" {
+	} else if isCloudModelID(activeID) {
 		opts.CloudModelName = activeID
 		opts.ExplicitProvider = "cloud"
 	}
@@ -268,5 +385,10 @@ func init() {
 	rootCmd.Flags().StringVar(&rootProject, "project", "", "Project ID or project name for the current CLI session")
 	rootCmd.PersistentFlags().BoolVar(&rootSandbox, "sandbox", false, "Run in a sandbox with terminal restrictions enabled")
 	rootCmd.Flags().BoolVar(&rootDryRun, "dry-run", false, "Preview planned tool calls without executing them")
-	rootCmd.Flags().StringVar(&rootTheme, "theme", "", "UI theme: 'dark' (default) or 'light'")
+	rootCmd.Flags().StringVar(&rootTheme, "theme", "", "UI theme: 'dark' (default), 'light', 'auto', 'tokyo-night', 'catppuccin', or 'high-contrast'")
+	rootCmd.PersistentFlags().BoolVar(&rootLocal, "local", false, "Run strictly offline/local-only without cloud API calls (shortcut for --routing-mode local-only)")
+	rootCmd.PersistentFlags().StringVar(&rootRoutingMode, "routing-mode", "", "Routing policy: hybrid|local-only|cloud-only")
+	rootCmd.PersistentFlags().StringVar(&rootBaseURL, "base-url", "", "OpenAI-compatible local endpoint base URL (also reads MG_OPENAI_BASE_URL)")
+	rootCmd.PersistentFlags().StringVar(&rootLocalFastModel, "local-fast-model", "", "Local fast-tier model for simple prompts")
+	rootCmd.PersistentFlags().StringVar(&rootLocalHeavyModel, "local-heavy-model", "", "Local heavy-tier model for complex prompts")
 }
