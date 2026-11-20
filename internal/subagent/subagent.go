@@ -2,6 +2,7 @@ package subagent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -78,6 +79,7 @@ type SubagentInfo struct {
 	StartTime      time.Time       `json:"start_time"`
 	EndTime        time.Time       `json:"end_time,omitempty"`
 	cancel         context.CancelFunc
+	done           chan struct{}
 }
 
 // Snapshot returns a thread-safe copy of SubagentInfo without internal mutex/cancel.
@@ -108,6 +110,9 @@ func (s *SubagentInfo) Snapshot() *SubagentInfo {
 
 // GetStatus returns the status string thread-safely.
 func (s *SubagentInfo) GetStatus() string {
+	if s == nil {
+		return ""
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.Status
@@ -115,6 +120,9 @@ func (s *SubagentInfo) GetStatus() string {
 
 // GetState returns the SubagentState thread-safely.
 func (s *SubagentInfo) GetState() SubagentState {
+	if s == nil {
+		return StateUnspecified
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.State
@@ -122,6 +130,9 @@ func (s *SubagentInfo) GetState() SubagentState {
 
 // GetResult returns the result string thread-safely.
 func (s *SubagentInfo) GetResult() string {
+	if s == nil {
+		return ""
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.Result
@@ -142,11 +153,14 @@ type SwarmPipelineStep struct {
 	DependsOn []string        `json:"depends_on,omitempty"`
 }
 
+const maxMailboxMessages = 1024
+
 type Manager struct {
-	mu          sync.RWMutex
-	subagents   map[string]*SubagentInfo
-	definitions map[string]SubagentDefinition
-	messages    map[string][]Message
+	mu            sync.RWMutex
+	wg            sync.WaitGroup
+	subagents     map[string]*SubagentInfo
+	definitions   map[string]SubagentDefinition
+	messages      map[string][]Message
 	eventBus      *events.EventBus
 	brainDir      string
 	defaultRunner func(ctx context.Context, sub *SubagentInfo, workDir string) (string, error)
@@ -269,7 +283,24 @@ func (m *Manager) ListDefinitions() []SubagentDefinition {
 }
 
 func (m *Manager) Spawn(ctx context.Context, id, role string, profile SubagentProfile, prompt, modelOverride string, workspace WorkspaceMode, runner func(ctx context.Context, sub *SubagentInfo) (string, error)) (*SubagentInfo, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if id == "" {
+		return nil, fmt.Errorf("subagent id is required")
+	}
+
 	m.mu.Lock()
+	if existing, exists := m.subagents[id]; exists {
+		st := existing.GetState()
+		if st == StateRunning || existing.GetStatus() == "RUNNING" {
+			m.mu.Unlock()
+			return nil, fmt.Errorf("subagent %q is already running", id)
+		}
+	}
 
 	subCtx, cancel := context.WithCancel(ctx)
 
@@ -311,74 +342,113 @@ func (m *Manager) Spawn(ctx context.Context, id, role string, profile SubagentPr
 		Status:         "RUNNING",
 		StartTime:      time.Now(),
 		cancel:         cancel,
+		done:           make(chan struct{}),
 	}
 	m.subagents[id] = info
 	eb := m.eventBus
+	defaultRunner := m.defaultRunner
+	wtCreator := m.wtCreator
+	wtRemover := m.wtRemover
+	snap := info.Snapshot()
+	m.wg.Add(1)
 	m.mu.Unlock()
 
 	go func() {
+		defer m.wg.Done()
+		defer close(info.done)
 		defer cancel()
+		defer func() {
+			if r := recover(); r != nil {
+				info.mu.Lock()
+				alreadyKilled := info.State == StateKilled || info.Status == "KILLED"
+				if !alreadyKilled {
+					info.EndTime = time.Now()
+					info.Status = "FAILED"
+					info.State = StateErrored
+					info.StateDetail = fmt.Sprintf("panic: %v", r)
+					info.Result = fmt.Sprintf("Error: panic: %v", r)
+				}
+				status := info.Status
+				resultMsg := info.Result
+				info.mu.Unlock()
+
+				if eb != nil {
+					eb.Publish("subagent_responses", fmt.Sprintf("Subagent [%s] (%s) %s: %s", id, role, status, resultMsg))
+				}
+			}
+		}()
 
 		var workDir string
 		cwd, _ := os.Getwd()
 		workDir = cwd
 		var wtCreated string
 
-		if (workspace == WorkspaceBranch || workspace == WorkspaceShare) && m.wtCreator != nil {
-			wtName := fmt.Sprintf("subagent-%s", id)
-			wtPath, err := m.wtCreator(cwd, wtName)
-			if err == nil && wtPath != "" {
-				workDir = wtPath
-				wtCreated = wtName
-			}
-		}
-
 		var res string
 		var err error
-		if runner != nil {
-			res, err = runner(subCtx, info)
-		} else if m.defaultRunner != nil {
-			res, err = m.defaultRunner(subCtx, info, workDir)
+		if subCtx.Err() != nil {
+			err = subCtx.Err()
 		} else {
-			time.Sleep(50 * time.Millisecond)
-			res = fmt.Sprintf("Subagent [%s] finished task (workspace: %s).", role, workDir)
-		}
-
-		if wtCreated != "" && err == nil && m.wtRemover != nil {
-			_ = m.wtRemover(cwd, wtCreated)
-		}
-
-		m.mu.Lock()
-		info.mu.Lock()
-		info.EndTime = time.Now()
-		if err != nil {
-			if subCtx.Err() == context.Canceled {
-				info.Status = "KILLED"
-				info.State = StateKilled
-				info.StateDetail = "Canceled by user"
-			} else {
-				info.Status = "FAILED"
-				info.State = StateErrored
-				info.StateDetail = err.Error()
-				info.Result = fmt.Sprintf("Error: %v", err)
+			if (workspace == WorkspaceBranch || workspace == WorkspaceShare) && wtCreator != nil {
+				wtName := fmt.Sprintf("subagent-%s", id)
+				wtPath, wtErr := wtCreator(cwd, wtName)
+				if wtErr == nil && wtPath != "" {
+					workDir = wtPath
+					wtCreated = wtName
+				}
 			}
-		} else {
-			info.Status = "COMPLETED"
-			info.State = StateCompleted
-			info.StateDetail = "Completed successfully"
-			info.Result = res
+
+			if runner != nil {
+				res, err = runner(subCtx, snap)
+			} else if defaultRunner != nil {
+				res, err = defaultRunner(subCtx, snap, workDir)
+			} else {
+				timer := time.NewTimer(50 * time.Millisecond)
+				select {
+				case <-subCtx.Done():
+					timer.Stop()
+					err = subCtx.Err()
+				case <-timer.C:
+					res = fmt.Sprintf("Subagent [%s] finished task (workspace: %s).", role, workDir)
+				}
+			}
+
+			if wtCreated != "" && err == nil && wtRemover != nil {
+				_ = wtRemover(cwd, wtCreated)
+			}
+		}
+
+		info.mu.Lock()
+		alreadyKilled := info.State == StateKilled || info.Status == "KILLED"
+		if !alreadyKilled {
+			info.EndTime = time.Now()
+			if err != nil {
+				if errors.Is(err, context.Canceled) || errors.Is(subCtx.Err(), context.Canceled) {
+					info.Status = "KILLED"
+					info.State = StateKilled
+					info.StateDetail = "Canceled by user"
+				} else {
+					info.Status = "FAILED"
+					info.State = StateErrored
+					info.StateDetail = err.Error()
+					info.Result = fmt.Sprintf("Error: %v", err)
+				}
+			} else {
+				info.Status = "COMPLETED"
+				info.State = StateCompleted
+				info.StateDetail = "Completed successfully"
+				info.Result = res
+			}
 		}
 		status := info.Status
 		resultMsg := info.Result
 		info.mu.Unlock()
-		m.mu.Unlock()
 
 		if eb != nil {
 			eb.Publish("subagent_responses", fmt.Sprintf("Subagent [%s] (%s) %s: %s", id, role, status, resultMsg))
 		}
 	}()
 
-	return info.Snapshot(), nil
+	return snap, nil
 }
 
 func (m *Manager) List() []*SubagentInfo {
@@ -414,11 +484,8 @@ func (m *Manager) Get(id string) (*SubagentInfo, bool) {
 
 func (m *Manager) Kill(id string) bool {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	info, exists := m.subagents[id]
 	if !exists {
-		// check by ConversationID as well
 		for _, sa := range m.subagents {
 			if sa.ConversationID == id {
 				info = sa
@@ -426,33 +493,43 @@ func (m *Manager) Kill(id string) bool {
 				break
 			}
 		}
-		if !exists {
-			return false
-		}
 	}
-	if info.cancel != nil {
-		info.cancel()
+	if !exists {
+		m.mu.Unlock()
+		return false
 	}
+
 	info.mu.Lock()
+	isRunning := info.State == StateRunning || info.Status == "RUNNING"
+	if !isRunning {
+		info.mu.Unlock()
+		m.mu.Unlock()
+		return false
+	}
+	cancelFn := info.cancel
 	info.Status = "KILLED"
 	info.State = StateKilled
 	info.StateDetail = "Canceled by manager"
 	info.EndTime = time.Now()
 	info.mu.Unlock()
+	m.mu.Unlock()
+
+	if cancelFn != nil {
+		cancelFn()
+	}
 	return true
 }
 
 func (m *Manager) KillAll() int {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
+	cancels := make([]context.CancelFunc, 0)
 	count := 0
 	for _, info := range m.subagents {
 		info.mu.Lock()
 		isRunning := info.Status == "RUNNING" || info.State == StateRunning
 		if isRunning {
 			if info.cancel != nil {
-				info.cancel()
+				cancels = append(cancels, info.cancel)
 			}
 			info.Status = "KILLED"
 			info.State = StateKilled
@@ -462,15 +539,64 @@ func (m *Manager) KillAll() int {
 		}
 		info.mu.Unlock()
 	}
+	m.mu.Unlock()
+
+	for _, cancelFn := range cancels {
+		cancelFn()
+	}
 	return count
 }
 
-func (m *Manager) SendMessage(senderID, receiverID, content string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+// Wait blocks until all currently spawned subagents finish or ctx is canceled.
+func (m *Manager) Wait(ctx context.Context) error {
+	if ctx == nil {
+		m.wg.Wait()
+		return nil
+	}
+	for {
+		m.mu.RLock()
+		var pending []<-chan struct{}
+		for _, info := range m.subagents {
+			if info.done != nil {
+				select {
+				case <-info.done:
+				default:
+					pending = append(pending, info.done)
+				}
+			}
+		}
+		m.mu.RUnlock()
 
+		if len(pending) == 0 {
+			return nil
+		}
+
+		for _, ch := range pending {
+			select {
+			case <-ch:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+	}
+}
+
+func appendBoundedMessage(queue []Message, msg Message) []Message {
+	if len(queue) >= maxMailboxMessages {
+		copy(queue, queue[1:])
+		queue[len(queue)-1] = msg
+		return queue
+	}
+	return append(queue, msg)
+}
+
+func (m *Manager) SendMessage(senderID, receiverID, content string) error {
+	if receiverID == "" {
+		return fmt.Errorf("receiver subagent id is required")
+	}
+
+	m.mu.Lock()
 	if _, exists := m.subagents[receiverID]; !exists && receiverID != "*" {
-		// Check by ConversationID
 		found := false
 		for k, sa := range m.subagents {
 			if sa.ConversationID == receiverID {
@@ -480,6 +606,7 @@ func (m *Manager) SendMessage(senderID, receiverID, content string) error {
 			}
 		}
 		if !found {
+			m.mu.Unlock()
 			return fmt.Errorf("receiver subagent [%s] not found", receiverID)
 		}
 	}
@@ -492,17 +619,22 @@ func (m *Manager) SendMessage(senderID, receiverID, content string) error {
 	}
 
 	if receiverID == "*" {
-		for targetID := range m.subagents {
+		for targetID, sa := range m.subagents {
 			if targetID != senderID {
-				m.messages[targetID] = append(m.messages[targetID], msg)
+				st := sa.GetState()
+				if st == StateRunning || sa.GetStatus() == "RUNNING" {
+					m.messages[targetID] = appendBoundedMessage(m.messages[targetID], msg)
+				}
 			}
 		}
 	} else {
-		m.messages[receiverID] = append(m.messages[receiverID], msg)
+		m.messages[receiverID] = appendBoundedMessage(m.messages[receiverID], msg)
 	}
+	eb := m.eventBus
+	m.mu.Unlock()
 
-	if m.eventBus != nil {
-		m.eventBus.Publish("subagent_messages", fmt.Sprintf("[%s -> %s]: %s", senderID, receiverID, content))
+	if eb != nil {
+		eb.Publish("subagent_messages", fmt.Sprintf("[%s -> %s]: %s", senderID, receiverID, content))
 	}
 	return nil
 }
@@ -511,7 +643,25 @@ func (m *Manager) GetMessages(subagentID string) []Message {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	msgs := m.messages[subagentID]
-	m.messages[subagentID] = nil // consume messages
-	return msgs
+	targetID := subagentID
+	if _, exists := m.messages[targetID]; !exists {
+		if _, known := m.subagents[targetID]; !known {
+			for k, sa := range m.subagents {
+				if sa.ConversationID == subagentID {
+					targetID = k
+					break
+				}
+			}
+		}
+	}
+
+	msgs := m.messages[targetID]
+	if len(msgs) == 0 {
+		delete(m.messages, targetID)
+		return nil
+	}
+	out := make([]Message, len(msgs))
+	copy(out, msgs)
+	delete(m.messages, targetID)
+	return out
 }

@@ -22,24 +22,41 @@ var errLimitReached = errors.New("search limit reached")
 
 // atomicWriteFile writes data to targetPath atomically using a temp file rename.
 func atomicWriteFile(targetPath string, data []byte, perm os.FileMode) error {
+	return atomicWriteFileWithRename(targetPath, data, perm, os.Rename)
+}
+
+func atomicWriteFileWithRename(targetPath string, data []byte, perm os.FileMode, renameFn func(string, string) error) error {
+	if info, statErr := os.Lstat(targetPath); statErr == nil {
+		if info.IsDir() {
+			return fmt.Errorf("target path %q is a directory", targetPath)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("refusing to write through symlink %q", targetPath)
+		}
+	}
+
 	dir := filepath.Dir(targetPath)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
 	tmp, err := os.CreateTemp(dir, ".mg-tmp-*")
 	if err != nil {
-		// Fallback to direct write if temp file creation fails
-		return os.WriteFile(targetPath, data, perm)
+		return fmt.Errorf("create temp file: %w", err)
 	}
 	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
+	cleanupTmp := true
+	defer func() {
+		if cleanupTmp {
+			_ = os.Remove(tmpName)
+		}
+	}()
 
 	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return err
 	}
 	if err := tmp.Sync(); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return err
 	}
 	if err := tmp.Close(); err != nil {
@@ -49,11 +66,41 @@ func atomicWriteFile(targetPath string, data []byte, perm os.FileMode) error {
 		// Non-fatal on Windows
 		_ = err
 	}
-	// Atomic replace
-	_ = os.Remove(targetPath) // on Windows rename requires target not to exist
-	if err := os.Rename(tmpName, targetPath); err != nil {
-		return os.WriteFile(targetPath, data, perm)
+
+	// Try direct atomic rename first (works on POSIX and modern Windows when target is unlocked).
+	renameErr := renameFn(tmpName, targetPath)
+	if renameErr == nil {
+		cleanupTmp = false
+		return nil
 	}
+
+	// If target does not exist, direct rename failure cannot be recovered by staging a backup.
+	if _, statErr := os.Lstat(targetPath); statErr != nil {
+		return fmt.Errorf("atomic rename failed: %w", renameErr)
+	}
+
+	// Stage a unique backup of the existing target so we never silently lose it on Windows.
+	bakTmp, bakErr := os.CreateTemp(dir, ".mg-bak-*")
+	if bakErr != nil {
+		return fmt.Errorf("stage backup before replace: %w (rename error: %v)", bakErr, renameErr)
+	}
+	backupPath := bakTmp.Name()
+	_ = bakTmp.Close()
+	_ = os.Remove(backupPath)
+
+	if bakRenameErr := renameFn(targetPath, backupPath); bakRenameErr != nil {
+		return fmt.Errorf("backup target before replace: %w (rename error: %v)", bakRenameErr, renameErr)
+	}
+
+	if replaceErr := renameFn(tmpName, targetPath); replaceErr != nil {
+		if rbErr := renameFn(backupPath, targetPath); rbErr != nil {
+			return fmt.Errorf("atomic replace failed (%w) and rollback from %q failed (%v)", replaceErr, backupPath, rbErr)
+		}
+		return fmt.Errorf("atomic replace failed (original file restored): %w", replaceErr)
+	}
+
+	cleanupTmp = false
+	_ = os.Remove(backupPath)
 	return nil
 }
 
@@ -485,11 +532,23 @@ func RegisterFSTools(r *Registry, defaultPolicy *policy.Policy) {
 		}
 
 		var results []matchResult
-		_ = filepath.Walk(searchPath, func(path string, info os.FileInfo, err error) error {
-			if err != nil || info == nil || info.IsDir() {
-				if info != nil && info.IsDir() && (info.Name() == "node_modules" || info.Name() == ".git") {
+		errWalk := filepath.Walk(searchPath, func(path string, info os.FileInfo, err error) error {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if err != nil || info == nil {
+				return nil
+			}
+			if info.IsDir() {
+				if info.Name() == "node_modules" || info.Name() == ".git" || defaultPolicy.CheckPathDenied(path) != nil {
 					return filepath.SkipDir
 				}
+				return nil
+			}
+			if info.Mode()&os.ModeSymlink != 0 {
+				return nil
+			}
+			if _, rerr := defaultPolicy.ResolvePath(path); rerr != nil {
 				return nil
 			}
 			if info.Size() > 2*1024*1024 {
@@ -499,10 +558,15 @@ func RegisterFSTools(r *Registry, defaultPolicy *policy.Policy) {
 			if err != nil {
 				return nil
 			}
+			defer f.Close()
 
 			scanner := bufio.NewScanner(f)
+			scanner.Buffer(make([]byte, 64*1024), 2*1024*1024)
 			lineNum := 1
 			for scanner.Scan() {
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
 				line := scanner.Text()
 				if re.MatchString(line) {
 					results = append(results, matchResult{
@@ -511,15 +575,16 @@ func RegisterFSTools(r *Registry, defaultPolicy *policy.Policy) {
 						LineContent: line,
 					})
 					if len(results) >= 50 {
-						f.Close()
-						return filepath.SkipDir
+						return errLimitReached
 					}
 				}
 				lineNum++
 			}
-			f.Close()
 			return nil
 		})
+		if errWalk != nil && !errors.Is(errWalk, errLimitReached) {
+			return "", errWalk
+		}
 
 		data, _ := json.MarshalIndent(results, "", "  ")
 		return string(data), nil
@@ -559,11 +624,21 @@ func RegisterFSTools(r *Registry, defaultPolicy *policy.Policy) {
 
 		var matches []string
 		errWalk := filepath.Walk(searchDir, func(path string, info os.FileInfo, err error) error {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			if err != nil || info == nil {
 				return nil
 			}
-			if info.IsDir() && (info.Name() == "node_modules" || info.Name() == ".git") {
-				return filepath.SkipDir
+			if info.IsDir() {
+				if info.Name() == "node_modules" || info.Name() == ".git" || defaultPolicy.CheckPathDenied(path) != nil {
+					return filepath.SkipDir
+				}
+			} else if info.Mode()&os.ModeSymlink != 0 {
+				return nil
+			}
+			if _, rerr := defaultPolicy.ResolvePath(path); rerr != nil {
+				return nil
 			}
 			matched, _ := filepath.Match(pattern, info.Name())
 			if matched || strings.Contains(strings.ToLower(info.Name()), strings.ToLower(pattern)) {
@@ -616,6 +691,9 @@ func RegisterFSTools(r *Registry, defaultPolicy *policy.Policy) {
 
 		var sb strings.Builder
 		for _, e := range entries {
+			if defaultPolicy.CheckPathDenied(filepath.Join(dir, e.Name())) != nil {
+				continue
+			}
 			tag := "[FILE]"
 			if e.IsDir() {
 				tag = "[DIR] "

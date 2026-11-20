@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
@@ -162,8 +161,7 @@ func registerLegacyTools(r *Registry, defaultPolicy *policy.Policy, ragStore *ra
 		if err != nil {
 			return "", err
 		}
-		_ = os.MkdirAll(filepath.Dir(resolvedPath), 0755)
-		if err := os.WriteFile(resolvedPath, []byte(content), 0644); err != nil {
+		if err := atomicWriteFile(resolvedPath, []byte(content), 0644); err != nil {
 			return "", err
 		}
 		return fmt.Sprintf("Successfully wrote %d bytes to %s", len(content), resolvedPath), nil
