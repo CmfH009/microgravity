@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -20,6 +21,18 @@ import (
 	"github.com/CmfH009/microgravity/internal/cmdparse"
 	"github.com/CmfH009/microgravity/internal/config"
 	"github.com/CmfH009/microgravity/internal/mcp"
+)
+
+const (
+	defaultBaseURL    = "https://generativelanguage.googleapis.com"
+	maxErrorBodyBytes = 64 * 1024
+)
+
+var (
+	// ErrQuotaExhausted indicates the cloud endpoint exhausted quota or billing.
+	ErrQuotaExhausted = errors.New("cloud quota or billing exhausted")
+	// ErrEmptyResponse indicates an HTTP 200 stream ended with no valid chunks.
+	ErrEmptyResponse = errors.New("cloud returned empty response")
 )
 
 type Client struct {
@@ -124,6 +137,13 @@ type UsageMetadata struct {
 	TotalTokenCount      int `json:"totalTokenCount"`
 }
 
+// APIError describes an error object embedded in a Gemini HTTP or SSE response.
+type APIError struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+	Status  string `json:"status"`
+}
+
 type GenerateResponse struct {
 	Candidates []struct {
 		Content struct {
@@ -131,6 +151,7 @@ type GenerateResponse struct {
 		} `json:"content"`
 	} `json:"candidates"`
 	UsageMetadata *UsageMetadata `json:"usageMetadata,omitempty"`
+	Error         *APIError      `json:"error,omitempty"`
 }
 
 type GenerateResult struct {
@@ -312,23 +333,95 @@ func ResolveCloudModel(modelID string) string {
 	}
 }
 
+func (c *Client) httpClient() *http.Client {
+	if c != nil && c.HTTPClient != nil {
+		return c.HTTPClient
+	}
+	return &http.Client{Timeout: 10 * time.Minute}
+}
+
+func (c *Client) baseURL() string {
+	if c == nil || strings.TrimSpace(c.BaseURL) == "" {
+		return defaultBaseURL
+	}
+	return strings.TrimRight(c.BaseURL, "/")
+}
+
+func drainAndClose(body io.ReadCloser) {
+	if body == nil {
+		return
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(body, maxErrorBodyBytes))
+	_ = body.Close()
+}
+
+func readBoundedErrorBody(body io.ReadCloser) string {
+	if body == nil {
+		return ""
+	}
+	data, _ := io.ReadAll(io.LimitReader(body, maxErrorBodyBytes))
+	_, _ = io.Copy(io.Discard, io.LimitReader(body, maxErrorBodyBytes))
+	_ = body.Close()
+	return strings.TrimSpace(string(data))
+}
+
+func isQuotaBody(body string) bool {
+	lower := strings.ToLower(body)
+	return strings.Contains(lower, "resource_exhausted") ||
+		strings.Contains(lower, "quota") ||
+		strings.Contains(lower, "billing") ||
+		strings.Contains(lower, "rate limit") ||
+		strings.Contains(lower, "ratelimit") ||
+		strings.Contains(lower, "insufficient_quota") ||
+		strings.Contains(lower, "payment required")
+}
+
+func formatCloudStatusError(statusCode int, body string) error {
+	if statusCode == http.StatusBadRequest && strings.Contains(body, "API key not valid") {
+		return fmt.Errorf("The Google Cloud API key configured in `mg auth` is invalid or was deleted. Please configure a new one by running `mg auth` again, or set the GEMINI_API_KEY environment variable manually (status %d): %s", statusCode, body)
+	}
+	if statusCode == http.StatusTooManyRequests || statusCode == http.StatusPaymentRequired || isQuotaBody(body) {
+		return fmt.Errorf("%w (status %d): %s", ErrQuotaExhausted, statusCode, body)
+	}
+	return fmt.Errorf("unexpected status code from cloud: %d, body: %s", statusCode, body)
+}
+
 func (c *Client) executeRequestWithRetry(ctx context.Context, apiKey, url string, reqBody GenerateRequest) (*http.Response, error) {
+	bearer := ""
+	if c != nil {
+		bearer = c.BearerToken
+	}
+	return c.executeRequestWithRetryAuth(ctx, apiKey, bearer, url, reqBody)
+}
+
+func (c *Client) executeRequestWithRetryAuth(ctx context.Context, apiKey, bearerToken, url string, reqBody GenerateRequest) (*http.Response, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	payload, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, err
+	}
+
 	maxAttempts := 3
 	var lastErr error
-	var resp *http.Response
+	httpClient := c.httpClient()
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		buf := new(bytes.Buffer)
-		if err := json.NewEncoder(buf).Encode(reqBody); err != nil {
+		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
 
-		req, err := http.NewRequestWithContext(ctx, "POST", url, buf)
+		req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(payload))
 		if err != nil {
 			return nil, err
 		}
-		if c.BearerToken != "" {
-			req.Header.Set("Authorization", "Bearer "+c.BearerToken)
+		if bearerToken != "" {
+			req.Header.Set("Authorization", "Bearer "+bearerToken)
 		} else if apiKey != "" {
 			req.Header.Set("x-goog-api-key", apiKey)
 		} else if token := config.GetToken(); token != nil && token.AccessToken != "" {
@@ -337,19 +430,31 @@ func (c *Client) executeRequestWithRetry(ctx context.Context, apiKey, url string
 		req.Header.Set("Content-Type", "application/json")
 
 		var retryAfter time.Duration
-		resp, err = c.HTTPClient.Do(req)
+		resp, err := httpClient.Do(req)
 		if err == nil {
 			if isTransientStatus(resp.StatusCode) {
 				// Throttling (429) and gateway/server faults (500/502/503/504)
 				// are worth retrying on the same model before the caller falls
 				// back to a different model endpoint.
 				retryAfter = parseRetryAfter(resp.Header.Get("Retry-After"))
-				resp.Body.Close()
-				lastErr = fmt.Errorf("transient cloud server error (status %d)", resp.StatusCode)
+				errBody := readBoundedErrorBody(resp.Body)
+				if resp.StatusCode == http.StatusTooManyRequests || isQuotaBody(errBody) {
+					lastErr = fmt.Errorf("%w: transient cloud server error (status %d): %s", ErrQuotaExhausted, resp.StatusCode, errBody)
+					// When the server explicitly reports quota exhaustion without a Retry-After hint,
+					// stop retrying the same model so GenerateWithTools can fail over immediately.
+					if resp.StatusCode == http.StatusTooManyRequests && retryAfter == 0 && isQuotaBody(errBody) {
+						return nil, fmt.Errorf("request failed on attempt %d: %w", attempt, lastErr)
+					}
+				} else {
+					lastErr = fmt.Errorf("transient cloud server error (status %d): %s", resp.StatusCode, errBody)
+				}
 			} else {
 				return resp, nil
 			}
 		} else {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
 			// Network-level failures (timeouts, resets) are retryable too.
 			lastErr = err
 		}
@@ -416,6 +521,15 @@ func sleepCtx(ctx context.Context, d time.Duration) error {
 }
 
 func (c *Client) GenerateWithTools(ctx context.Context, model, prompt string, images []string, tools []mcp.Tool, out io.Writer) (*GenerateResult, error) {
+	if c == nil {
+		return nil, fmt.Errorf("cloud client is nil")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if out == nil {
 		out = io.Discard
 	}
@@ -428,12 +542,16 @@ func (c *Client) GenerateWithTools(ctx context.Context, model, prompt string, im
 		return nil, err
 	}
 
+	baseURL := c.baseURL()
+	isCustomBaseURL := baseURL != defaultBaseURL
+
 	// Check if Vertex AI is configured or requested
 	authType := config.GetAuthType()
-	isVertex := strings.HasPrefix(authType, "vertex") || os.Getenv("VERTEX_API_KEY") != "" || os.Getenv("VERTEX_PROJECT_ID") != "" || c.VertexCreds != nil
+	isVertex := c.VertexCreds != nil || (!isCustomBaseURL && (strings.HasPrefix(authType, "vertex") || os.Getenv("VERTEX_API_KEY") != "" || os.Getenv("VERTEX_PROJECT_ID") != ""))
 
 	var isVertexMode bool
 	var vertexCreds *authutil.VertexCredentials
+	var vertexErr error
 
 	if isVertex {
 		if c.VertexCreds != nil {
@@ -442,32 +560,49 @@ func (c *Client) GenerateWithTools(ctx context.Context, model, prompt string, im
 		} else if vCreds, vErr := authutil.ResolveVertexCredentials(ctx); vErr == nil && vCreds != nil {
 			vertexCreds = vCreds
 			isVertexMode = true
+		} else if vErr != nil {
+			vertexErr = vErr
 		}
 	}
 
-	apiKey := os.Getenv("GEMINI_API_KEY")
+	apiKey := c.APIKey
 	if apiKey == "" {
-		apiKey = c.APIKey
+		apiKey = os.Getenv("GEMINI_API_KEY")
 	}
+	if apiKey == "" {
+		apiKey = os.Getenv("GOOGLE_API_KEY")
+	}
+	bearerToken := c.BearerToken
 
 	if isVertexMode {
 		if vertexCreds.Mode == "express" {
 			apiKey = vertexCreds.APIKey
-			c.BearerToken = ""
+			bearerToken = ""
 		} else if vertexCreds.Token != nil {
-			c.BearerToken = vertexCreds.Token.AccessToken
+			bearerToken = vertexCreds.Token.AccessToken
 			apiKey = ""
 		}
-	} else {
-		if apiKey == "" {
-			if validKey, err := authutil.EnsureValidTokenAndAPIKey(); err == nil && validKey != "" {
-				apiKey = validKey
-			} else {
-				apiKey = config.GetAutoAPIKey()
+	} else if apiKey == "" && bearerToken == "" {
+		var authErr error
+		if validKey, err := authutil.EnsureValidTokenAndAPIKey(); err == nil && validKey != "" {
+			apiKey = validKey
+		} else {
+			authErr = err
+			apiKey = config.GetAutoAPIKey()
+		}
+		if apiKey == "" && bearerToken == "" {
+			if token := config.GetToken(); token != nil && token.AccessToken != "" {
+				bearerToken = token.AccessToken
 			}
 		}
-		if apiKey == "" {
-			return nil, fmt.Errorf("Google account auth failed or API key not provisioned. Please run 'mg auth' (AI Studio) or 'mg auth vertex' (Vertex AI).")
+		if apiKey == "" && bearerToken == "" {
+			if vertexErr != nil {
+				return nil, fmt.Errorf("Google account auth failed (vertex resolution: %w). Please run 'mg auth' (AI Studio) or 'mg auth vertex' (Vertex AI)", vertexErr)
+			}
+			if authErr != nil {
+				return nil, fmt.Errorf("Google account auth failed (%w) or API key not provisioned. Please run 'mg auth' (AI Studio) or 'mg auth vertex' (Vertex AI)", authErr)
+			}
+			return nil, fmt.Errorf("Google account auth failed or API key not provisioned. Please run 'mg auth' (AI Studio) or 'mg auth vertex' (Vertex AI)")
 		}
 	}
 
@@ -528,48 +663,59 @@ func (c *Client) GenerateWithTools(ctx context.Context, model, prompt string, im
 	seen := make(map[string]bool)
 
 	var resp *http.Response
-	var err error
+	var lastErr error
 
 	for _, ep := range endpointsToTry {
 		if seen[ep] {
 			continue
 		}
 		seen[ep] = true
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 
 		var url string
 		if isVertexMode {
 			url = authutil.BuildVertexEndpoint(vertexCreds.Mode, vertexCreds.Location, vertexCreds.ProjectID, ep)
 		} else {
-			url = fmt.Sprintf("%s/v1beta/models/%s:streamGenerateContent?alt=sse", c.BaseURL, ep)
+			url = fmt.Sprintf("%s/v1beta/models/%s:streamGenerateContent?alt=sse", baseURL, ep)
 		}
 
-		resp, err = c.executeRequestWithRetry(ctx, apiKey, url, reqBody)
-
-		if err == nil && resp != nil && resp.StatusCode == http.StatusOK {
-			break // Successfully got 200 OK response
-		}
-		if resp != nil && (resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusNotFound) {
-			// Close response body and try next model candidate in fallback loop
-			resp.Body.Close()
+		candidateResp, reqErr := c.executeRequestWithRetryAuth(ctx, apiKey, bearerToken, url, reqBody)
+		if reqErr != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			lastErr = reqErr
 			continue
 		}
-		if resp != nil && resp.Body != nil {
-			break // Keep response for error formatting if other status code
+		if candidateResp == nil {
+			lastErr = fmt.Errorf("empty response from cloud endpoint %s", ep)
+			continue
 		}
+		if candidateResp.StatusCode == http.StatusOK {
+			resp = candidateResp
+			break
+		}
+
+		errBody := readBoundedErrorBody(candidateResp.Body)
+		statusErr := formatCloudStatusError(candidateResp.StatusCode, errBody)
+		lastErr = statusErr
+
+		if candidateResp.StatusCode == http.StatusNotFound {
+			continue
+		}
+		// Billing/quota (402), non-retryable quota errors, and auth errors fail fast without scanning fallback models.
+		return nil, statusErr
 	}
 
-	if err != nil {
-		return nil, fmt.Errorf("network/TLS handshake or request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		if resp.StatusCode == http.StatusBadRequest && strings.Contains(string(bodyBytes), "API key not valid") {
-			return nil, fmt.Errorf("The Google Cloud API key configured in `mg auth` is invalid or was deleted. Please configure a new one by running `mg auth` again, or set the GEMINI_API_KEY environment variable manually.")
+	if resp == nil {
+		if lastErr != nil {
+			return nil, fmt.Errorf("network/TLS handshake or request failed: %w", lastErr)
 		}
-		return nil, fmt.Errorf("unexpected status code from cloud: %d, body: %s", resp.StatusCode, string(bodyBytes))
+		return nil, fmt.Errorf("cloud request failed: no endpoints succeeded")
 	}
+	defer drainAndClose(resp.Body)
 
 	var fullResponse strings.Builder
 	var toolCalls []cmdparse.ToolCall
@@ -580,58 +726,103 @@ func (c *Client) GenerateWithTools(ctx context.Context, model, prompt string, im
 
 	// Latest usage metadata reported by the API (present on stream chunks).
 	var usage *UsageMetadata
+	validChunks := 0
+	malformedChunks := 0
+	var lastParseErr error
 
 	// Read SSE
 	for scanner.Scan() {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		line := scanner.Text()
-		if strings.HasPrefix(line, "data: ") {
-			data := strings.TrimPrefix(line, "data: ")
-			var genResp GenerateResponse
-			if err := json.Unmarshal([]byte(data), &genResp); err == nil {
-				if genResp.UsageMetadata != nil {
-					usage = genResp.UsageMetadata
+		var data string
+		if strings.HasPrefix(line, "data:") {
+			data = strings.TrimPrefix(line, "data:")
+			data = strings.TrimPrefix(data, " ")
+		} else if strings.HasPrefix(strings.TrimSpace(line), "{") {
+			data = strings.TrimSpace(line)
+		} else {
+			continue
+		}
+
+		trimmed := strings.TrimSpace(data)
+		if trimmed == "" || trimmed == "[DONE]" {
+			continue
+		}
+
+		var genResp GenerateResponse
+		if err := json.Unmarshal([]byte(trimmed), &genResp); err != nil {
+			malformedChunks++
+			lastParseErr = err
+			continue
+		}
+		if genResp.Error != nil {
+			errMsg := genResp.Error.Message
+			if genResp.Error.Status != "" {
+				errMsg = genResp.Error.Status + ": " + errMsg
+			}
+			if genResp.Error.Code == http.StatusTooManyRequests ||
+				genResp.Error.Code == http.StatusPaymentRequired ||
+				strings.EqualFold(genResp.Error.Status, "RESOURCE_EXHAUSTED") ||
+				isQuotaBody(errMsg) {
+				return nil, fmt.Errorf("%w: cloud stream error (code %d): %s", ErrQuotaExhausted, genResp.Error.Code, errMsg)
+			}
+			return nil, fmt.Errorf("cloud stream error (code %d): %s", genResp.Error.Code, errMsg)
+		}
+
+		validChunks++
+		if genResp.UsageMetadata != nil {
+			usage = genResp.UsageMetadata
+		}
+		if len(genResp.Candidates) > 0 {
+			for _, part := range genResp.Candidates[0].Content.Parts {
+				if part.Text != "" {
+					fmt.Fprint(out, part.Text)
+					fullResponse.WriteString(part.Text)
 				}
-				if len(genResp.Candidates) > 0 {
-					for _, part := range genResp.Candidates[0].Content.Parts {
-						if part.Text != "" {
-							fmt.Fprint(out, part.Text)
-							fullResponse.WriteString(part.Text)
-						}
-						if part.FunctionCall != nil {
-							fc := part.FunctionCall
-							if fc.Name != "" {
-								if activeToolCall != nil && activeToolCall.ToolCall == "" {
-									activeToolCall.ToolCall = fc.Name
-									for k, v := range fc.Args {
-										activeToolCall.Arguments[k] = v
-									}
-								} else if activeToolCall != nil && activeToolCall.ToolCall == fc.Name {
-									for k, v := range fc.Args {
-										activeToolCall.Arguments[k] = v
-									}
-								} else {
-									if activeToolCall != nil && activeToolCall.ToolCall != "" {
-										toolCalls = append(toolCalls, *activeToolCall)
-									}
-									args := make(map[string]interface{})
-									for k, v := range fc.Args {
-										args[k] = v
-									}
-									activeToolCall = &cmdparse.ToolCall{
-										ToolCall:  fc.Name,
-										Arguments: args,
-									}
-								}
-							} else {
-								if activeToolCall == nil {
-									activeToolCall = &cmdparse.ToolCall{
-										Arguments: make(map[string]interface{}),
-									}
-								}
-								for k, v := range fc.Args {
-									activeToolCall.Arguments[k] = v
-								}
+				if part.FunctionCall != nil {
+					fc := part.FunctionCall
+					if fc.Name != "" {
+						if activeToolCall != nil && activeToolCall.ToolCall == "" {
+							activeToolCall.ToolCall = fc.Name
+							if activeToolCall.Arguments == nil {
+								activeToolCall.Arguments = make(map[string]interface{})
 							}
+							for k, v := range fc.Args {
+								activeToolCall.Arguments[k] = v
+							}
+						} else if activeToolCall != nil && activeToolCall.ToolCall == fc.Name {
+							if activeToolCall.Arguments == nil {
+								activeToolCall.Arguments = make(map[string]interface{})
+							}
+							for k, v := range fc.Args {
+								activeToolCall.Arguments[k] = v
+							}
+						} else {
+							if activeToolCall != nil && activeToolCall.ToolCall != "" {
+								toolCalls = append(toolCalls, *activeToolCall)
+							}
+							args := make(map[string]interface{})
+							for k, v := range fc.Args {
+								args[k] = v
+							}
+							activeToolCall = &cmdparse.ToolCall{
+								ToolCall:  fc.Name,
+								Arguments: args,
+							}
+						}
+					} else {
+						if activeToolCall == nil {
+							activeToolCall = &cmdparse.ToolCall{
+								Arguments: make(map[string]interface{}),
+							}
+						}
+						if activeToolCall.Arguments == nil {
+							activeToolCall.Arguments = make(map[string]interface{})
+						}
+						for k, v := range fc.Args {
+							activeToolCall.Arguments[k] = v
 						}
 					}
 				}
@@ -642,6 +833,23 @@ func (c *Client) GenerateWithTools(ctx context.Context, model, prompt string, im
 		toolCalls = append(toolCalls, *activeToolCall)
 		activeToolCall = nil
 	}
+
+	if scanErr := scanner.Err(); scanErr != nil {
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("cloud stream cancelled: %w", ctx.Err())
+		}
+		return nil, fmt.Errorf("cloud stream read error: %w", scanErr)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if validChunks == 0 {
+		if malformedChunks > 0 {
+			return nil, fmt.Errorf("malformed cloud SSE stream (%d invalid chunks): %w", malformedChunks, lastParseErr)
+		}
+		return nil, fmt.Errorf("%w: %w", ErrEmptyResponse, io.ErrUnexpectedEOF)
+	}
+
 	fmt.Fprintln(out) // Final newline
 
 	// Record real token usage against the daily budget. Gemini reports usage
@@ -663,7 +871,7 @@ func (c *Client) GenerateWithTools(ctx context.Context, model, prompt string, im
 	return &GenerateResult{
 		Text:      fullResponse.String(),
 		ToolCalls: toolCalls,
-	}, scanner.Err()
+	}, nil
 }
 
 // Generate calls GenerateWithTools with nil tools for backward compatibility.

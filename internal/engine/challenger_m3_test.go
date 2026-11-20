@@ -26,6 +26,7 @@ func TestAdversarial_DualModeExecutionAndFallback(t *testing.T) {
 	}
 
 	setupSession := func(t *testing.T, ssePayloads []string) (*engine.Session, *[]executionRecord) {
+		isolateEngineTestEnv(t)
 		var execMu sync.Mutex
 		var executed []executionRecord
 		var requestCount int32

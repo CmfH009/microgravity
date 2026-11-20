@@ -5,8 +5,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -18,6 +20,18 @@ import (
 	"github.com/CmfH009/microgravity/internal/mcp"
 )
 
+const (
+	defaultBaseURL    = "http://localhost:11434"
+	maxErrorBodyBytes = 64 * 1024
+)
+
+var (
+	// ErrEmptyResponse indicates the Ollama HTTP 200 stream ended without valid chunks.
+	ErrEmptyResponse = errors.New("ollama returned empty response")
+	// ErrModelNotFound indicates Ollama returned 404 for the requested model.
+	ErrModelNotFound = errors.New("ollama model not found")
+)
+
 var EnableDebug = false
 
 type Client struct {
@@ -25,23 +39,71 @@ type Client struct {
 	HTTPClient *http.Client
 }
 
+func newDefaultHTTPClient() *http.Client {
+	transport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   15 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ResponseHeaderTimeout: 45 * time.Second,
+		IdleConnTimeout:       90 * time.Second,
+		MaxIdleConns:          32,
+		MaxIdleConnsPerHost:   8,
+	}
+	return &http.Client{
+		Transport: transport,
+		Timeout:   10 * time.Minute,
+	}
+}
+
 func NewClient(baseURL string) *Client {
 	if baseURL == "" {
-		baseURL = "http://localhost:11434"
+		baseURL = defaultBaseURL
 	}
 	return &Client{
-		BaseURL: baseURL,
-		HTTPClient: &http.Client{
-			Timeout: 10 * time.Minute,
-		},
+		BaseURL:    strings.TrimRight(baseURL, "/"),
+		HTTPClient: newDefaultHTTPClient(),
 	}
+}
+
+func (c *Client) httpClient() *http.Client {
+	if c != nil && c.HTTPClient != nil {
+		return c.HTTPClient
+	}
+	return newDefaultHTTPClient()
+}
+
+func (c *Client) baseURL() string {
+	if c == nil || strings.TrimSpace(c.BaseURL) == "" {
+		return defaultBaseURL
+	}
+	return strings.TrimRight(c.BaseURL, "/")
+}
+
+func drainAndClose(body io.ReadCloser) {
+	if body == nil {
+		return
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(body, maxErrorBodyBytes))
+	_ = body.Close()
+}
+
+func readBoundedErrorBody(body io.ReadCloser) string {
+	if body == nil {
+		return ""
+	}
+	data, _ := io.ReadAll(io.LimitReader(body, maxErrorBodyBytes))
+	_, _ = io.Copy(io.Discard, io.LimitReader(body, maxErrorBodyBytes))
+	_ = body.Close()
+	return strings.TrimSpace(string(data))
 }
 
 func EnsureOllama() {
 	client := &http.Client{Timeout: 2 * time.Second}
-	resp, err := client.Get("http://localhost:11434/")
+	resp, err := client.Get(defaultBaseURL + "/")
 	if err == nil {
-		resp.Body.Close()
+		drainAndClose(resp.Body)
 		return
 	}
 
@@ -57,6 +119,7 @@ func EnsureOllama() {
 	cmd := exec.Command("ollama", "serve")
 	if err := cmd.Start(); err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to start Ollama: %v\n", err)
+		return
 	}
 	// Give it a moment to boot
 	time.Sleep(2 * time.Second)
@@ -107,6 +170,7 @@ type ChatResponse struct {
 	Message  ChatMessage `json:"message"`
 	Response string      `json:"response,omitempty"`
 	Done     bool        `json:"done"`
+	Error    string      `json:"error,omitempty"`
 }
 
 // MCPToOllamaTools converts MCP tool definitions to Ollama tools format.
@@ -135,6 +199,15 @@ func MCPToOllamaTools(tools []mcp.Tool) []OllamaTool {
 var mcpToOllamaTools = MCPToOllamaTools
 
 func (c *Client) GenerateWithTools(ctx context.Context, model, prompt string, images []string, tools []mcp.Tool, out io.Writer) (*GenerateResult, error) {
+	if c == nil {
+		return nil, fmt.Errorf("ollama client is nil")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if out == nil {
 		out = io.Discard
 	}
@@ -179,7 +252,7 @@ func (c *Client) GenerateWithTools(ctx context.Context, model, prompt string, im
 		return nil, err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", c.BaseURL+"/api/chat", buf)
+	req, err := http.NewRequestWithContext(ctx, "POST", c.baseURL()+"/api/chat", buf)
 	if err != nil {
 		return nil, err
 	}
@@ -189,29 +262,27 @@ func (c *Client) GenerateWithTools(ctx context.Context, model, prompt string, im
 		fmt.Printf("[DEBUG] Sending request to Ollama API for model %s...\n", model)
 	}
 
-	// 30s timeout for initial response / model load
-	clientCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
-	defer cancel()
-
-	reqWithTimeout := req.WithContext(clientCtx)
-	resp, err := c.HTTPClient.Do(reqWithTimeout)
+	resp, err := c.httpClient().Do(req)
 	if err != nil {
 		if EnableDebug {
 			fmt.Printf("[DEBUG] HTTP Request failed: %v\n", err)
 		}
-		return nil, fmt.Errorf("local model %s load timeout (45s): %w", model, err)
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("ollama request cancelled: %w", ctx.Err())
+		}
+		return nil, fmt.Errorf("ollama request failed for model %s: %w", model, err)
 	}
-	defer resp.Body.Close()
+	defer drainAndClose(resp.Body)
 	if EnableDebug {
 		fmt.Printf("[DEBUG] HTTP Request succeeded. Status: %d\n", resp.StatusCode)
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		if resp.StatusCode == 404 {
-			return nil, fmt.Errorf("The local AI model is currently downloading in the background! Please wait a moment and try again.")
+		errBody := readBoundedErrorBody(resp.Body)
+		if resp.StatusCode == http.StatusNotFound {
+			return nil, fmt.Errorf("%w: local AI model %s unavailable or downloading: %s", ErrModelNotFound, model, errBody)
 		}
-		return nil, fmt.Errorf("unexpected status code: %d, body: %s", resp.StatusCode, string(bodyBytes))
+		return nil, fmt.Errorf("unexpected status code from ollama: %d, body: %s", resp.StatusCode, errBody)
 	}
 
 	var fullResponse strings.Builder
@@ -221,18 +292,30 @@ func (c *Client) GenerateWithTools(ctx context.Context, model, prompt string, im
 	scanner.Buffer(scanBuf, 10*1024*1024) // 10MB max capacity
 
 	chunks := 0
+	validChunks := 0
+	receivedDone := false
+
 	for scanner.Scan() {
+		if err := ctx.Err(); err != nil {
+			return nil, fmt.Errorf("ollama stream cancelled: %w", err)
+		}
 		chunks++
-		line := scanner.Bytes()
+		line := bytes.TrimSpace(scanner.Bytes())
+		if len(line) == 0 {
+			continue
+		}
 		var genResp ChatResponse
-		err := json.Unmarshal(line, &genResp)
-		if err != nil {
+		if err := json.Unmarshal(line, &genResp); err != nil {
 			if EnableDebug {
 				fmt.Printf("[DEBUG] Failed to unmarshal chunk %d: %v. Line snippet: %s\n", chunks, err, string(line[:min(len(line), 100)]))
 			}
-			continue
+			return nil, fmt.Errorf("malformed ollama NDJSON chunk %d: %w", chunks, err)
 		}
-		if chunks == 1 && EnableDebug {
+		if genResp.Error != "" {
+			return nil, fmt.Errorf("ollama stream error: %s", genResp.Error)
+		}
+		validChunks++
+		if validChunks == 1 && EnableDebug {
 			fmt.Printf("[DEBUG] First chunk successfully parsed\n")
 		}
 		content := genResp.Message.Content
@@ -304,6 +387,7 @@ func (c *Client) GenerateWithTools(ctx context.Context, model, prompt string, im
 		}
 
 		if genResp.Done {
+			receivedDone = true
 			if EnableDebug {
 				fmt.Printf("[DEBUG] Received done=true on chunk %d\n", chunks)
 			}
@@ -311,8 +395,23 @@ func (c *Client) GenerateWithTools(ctx context.Context, model, prompt string, im
 		}
 	}
 
-	if err := scanner.Err(); err != nil && EnableDebug {
-		fmt.Printf("[DEBUG] Scanner error after %d chunks: %v\n", chunks, err)
+	if scanErr := scanner.Err(); scanErr != nil {
+		if EnableDebug {
+			fmt.Printf("[DEBUG] Scanner error after %d chunks: %v\n", chunks, scanErr)
+		}
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("ollama stream cancelled: %w", ctx.Err())
+		}
+		return nil, fmt.Errorf("ollama stream read error: %w", scanErr)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("ollama stream cancelled: %w", err)
+	}
+	if validChunks == 0 {
+		return nil, fmt.Errorf("%w: %w", ErrEmptyResponse, io.ErrUnexpectedEOF)
+	}
+	if !receivedDone {
+		return nil, fmt.Errorf("ollama stream ended prematurely without done=true: %w", io.ErrUnexpectedEOF)
 	}
 
 	fmt.Fprintln(out) // Print final newline
@@ -325,7 +424,7 @@ func (c *Client) GenerateWithTools(ctx context.Context, model, prompt string, im
 	return &GenerateResult{
 		Text:      fullResponse.String(),
 		ToolCalls: toolCalls,
-	}, scanner.Err()
+	}, nil
 }
 
 func (c *Client) Generate(ctx context.Context, model, prompt string, images []string, out io.Writer) (string, error) {
@@ -358,9 +457,20 @@ type PullProgress struct {
 	Digest    string `json:"digest"`
 	Total     int64  `json:"total"`
 	Completed int64  `json:"completed"`
+	Error     string `json:"error,omitempty"`
 }
 
 func (c *Client) Pull(ctx context.Context, model string, onProgress func(PullProgress)) error {
+	if c == nil {
+		return fmt.Errorf("ollama client is nil")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	reqBody := PullRequest{
 		Model:  model,
 		Stream: true,
@@ -370,32 +480,51 @@ func (c *Client) Pull(ctx context.Context, model string, onProgress func(PullPro
 		return err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", c.BaseURL+"/api/pull", buf)
+	req, err := http.NewRequestWithContext(ctx, "POST", c.baseURL()+"/api/pull", buf)
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := c.HTTPClient.Do(req)
+	resp, err := c.httpClient().Do(req)
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer drainAndClose(resp.Body)
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("unexpected status code during pull: %d", resp.StatusCode)
+		errBody := readBoundedErrorBody(resp.Body)
+		return fmt.Errorf("unexpected status code during pull: %d, body: %s", resp.StatusCode, errBody)
 	}
 
 	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 	for scanner.Scan() {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		line := bytes.TrimSpace(scanner.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		var p PullProgress
+		if err := json.Unmarshal(line, &p); err != nil {
+			return fmt.Errorf("malformed pull progress JSON: %w", err)
+		}
+		if p.Error != "" {
+			return fmt.Errorf("ollama pull error: %s", p.Error)
+		}
 		if onProgress != nil {
-			var p PullProgress
-			if err := json.Unmarshal(scanner.Bytes(), &p); err == nil {
-				onProgress(p)
-			}
+			onProgress(p)
 		}
 	}
-	return scanner.Err()
+	if scanErr := scanner.Err(); scanErr != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return scanErr
+	}
+	return ctx.Err()
 }
 
 type ModelListResponse struct {
@@ -404,36 +533,71 @@ type ModelListResponse struct {
 	} `json:"models"`
 }
 
-// HasModel checks if a model is already downloaded locally.
-func (c *Client) HasModel(ctx context.Context, modelName string) (bool, error) {
-	req, err := http.NewRequestWithContext(ctx, "GET", c.BaseURL+"/api/tags", nil)
-	if err != nil {
-		return false, err
+// ListModels returns the names of all locally downloaded Ollama models.
+func (c *Client) ListModels(ctx context.Context) ([]string, error) {
+	if c == nil {
+		return nil, fmt.Errorf("ollama client is nil")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
-	resp, err := c.HTTPClient.Do(req)
+	req, err := http.NewRequestWithContext(ctx, "GET", c.baseURL()+"/api/tags", nil)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
-	defer resp.Body.Close()
+
+	resp, err := c.httpClient().Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer drainAndClose(resp.Body)
 
 	if resp.StatusCode != http.StatusOK {
-		return false, fmt.Errorf("failed to get tags: %d", resp.StatusCode)
+		errBody := readBoundedErrorBody(resp.Body)
+		return nil, fmt.Errorf("failed to get tags: status %d, body: %s", resp.StatusCode, errBody)
 	}
 
 	var list ModelListResponse
 	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
-		return false, err
+		return nil, fmt.Errorf("decode tags response: %w", err)
 	}
 
+	names := make([]string, 0, len(list.Models))
 	for _, m := range list.Models {
-		if m.Name == modelName {
-			return true, nil
-		}
-		// Also check without tag if modelName has no tag
-		if !strings.Contains(modelName, ":") && strings.HasPrefix(m.Name, modelName+":latest") {
-			return true, nil
+		if m.Name != "" {
+			names = append(names, m.Name)
 		}
 	}
-	return false, nil
+	return names, nil
+}
+
+// HasModel checks if a model is already downloaded locally.
+func (c *Client) HasModel(ctx context.Context, modelName string) (bool, error) {
+	names, err := c.ListModels(ctx)
+	if err != nil {
+		return false, err
+	}
+	return MatchModelName(names, modelName), nil
+}
+
+// MatchModelName reports whether modelName exists in downloaded model names,
+// checking exact match or ":latest" when modelName has no explicit tag.
+func MatchModelName(names []string, modelName string) bool {
+	if modelName == "" {
+		return false
+	}
+	hasTag := strings.Contains(modelName, ":")
+	for _, name := range names {
+		if name == modelName {
+			return true
+		}
+		if !hasTag && name == modelName+":latest" {
+			return true
+		}
+	}
+	return false
 }

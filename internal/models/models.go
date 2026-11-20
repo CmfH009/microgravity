@@ -28,13 +28,36 @@ type Scanner struct {
 }
 
 func NewScanner() *Scanner {
+	return NewScannerWithClient(ollama.NewClient("http://localhost:11434"))
+}
+
+// NewScannerWithClient creates a Scanner backed by a custom Ollama client.
+func NewScannerWithClient(client *ollama.Client) *Scanner {
+	if client == nil {
+		client = ollama.NewClient("http://localhost:11434")
+	}
 	return &Scanner{
-		ollamaClient: ollama.NewClient("http://localhost:11434"),
+		ollamaClient: client,
 	}
 }
 
 func (s *Scanner) Scan(ctx context.Context) ([]ModelInfo, error) {
-	v, _ := mem.VirtualMemory()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	v, err := mem.VirtualMemoryWithContext(ctx)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, fmt.Errorf("read virtual memory: %w", err)
+	}
+	if v == nil {
+		return nil, fmt.Errorf("read virtual memory: empty stats")
+	}
 	totalRAMGB := float64(v.Total) / (1024 * 1024 * 1024)
 
 	knownModels := []ModelInfo{
@@ -368,10 +391,18 @@ func (s *Scanner) Scan(ctx context.Context) ([]ModelInfo, error) {
 		},
 	}
 
+	var installedOllama []string
+	var ollamaErr error
+	if s != nil && s.ollamaClient != nil {
+		installedOllama, ollamaErr = s.ollamaClient.ListModels(ctx)
+		if ollamaErr != nil && ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+	}
+
 	for i := range knownModels {
 		if knownModels[i].Provider == "ollama" {
-			hasModel, err := s.ollamaClient.HasModel(ctx, knownModels[i].ID)
-			if err == nil && hasModel {
+			if ollamaErr == nil && ollama.MatchModelName(installedOllama, knownModels[i].ID) {
 				knownModels[i].Status = "Downloaded (Ready Offline)"
 			} else if totalRAMGB >= knownModels[i].MinRAMGB {
 				knownModels[i].Status = "Available Offline (Can Download)"

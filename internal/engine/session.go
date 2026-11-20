@@ -77,6 +77,7 @@ type SessionConfig struct {
 	AutoApprove      bool
 	DisableSlash     bool
 	CavemanLevel     string
+	MaxTurns         int
 	Registry         *tools.Registry
 	MCPClients       []*mcp.Client
 	MCPRouter        map[string]*mcp.Client
@@ -100,6 +101,7 @@ type AsyncEvent struct {
 // Session coordinates the multi-turn agent loop, context assembly, and tool dispatching.
 type Session struct {
 	mu            sync.RWMutex
+	ckptMu        sync.Mutex
 	Config        SessionConfig
 	State         ExecutionState
 	Conversation  strings.Builder
@@ -113,6 +115,9 @@ type Session struct {
 	SubID         int
 	AsyncEvents   chan AsyncEvent
 	subIDs        map[string]int
+	closeCh       chan struct{}
+	closed        bool
+	subWg         sync.WaitGroup
 	CheckpointMgr *git.CheckpointManager
 	Verifier      *verifier.Verifier
 }
@@ -123,7 +128,11 @@ func NewSession(cfg SessionConfig) (*Session, error) {
 		cfg.SessionName = "default"
 	}
 	if cfg.Cwd == "" {
-		cfg.Cwd, _ = os.Getwd()
+		cwd, err := os.Getwd()
+		if err != nil {
+			cwd = "."
+		}
+		cfg.Cwd = cwd
 	}
 	if cfg.LocalModelName == "" {
 		cfg.LocalModelName = "gemma:2b"
@@ -159,6 +168,7 @@ func NewSession(cfg SessionConfig) (*Session, error) {
 		OllamaClient:  ollama.NewClient(cfg.OllamaBaseURL),
 		CloudClient:   cloud.NewClient(),
 		Router:        router.NewRouter(),
+		closeCh:       make(chan struct{}),
 		CheckpointMgr: git.NewCheckpointManager(cfg.Cwd, cfg.SessionName),
 		Verifier:      verifier.New(),
 	}
@@ -170,9 +180,23 @@ func NewSession(cfg SessionConfig) (*Session, error) {
 			t := topic
 			ch, id := cfg.EventBus.Subscribe(t)
 			s.subIDs[t] = id
+			s.subWg.Add(1)
 			go func(c <-chan string, top string) {
-				for msg := range c {
-					s.AsyncEvents <- AsyncEvent{Topic: top, Payload: msg}
+				defer s.subWg.Done()
+				for {
+					select {
+					case msg, ok := <-c:
+						if !ok {
+							return
+						}
+						select {
+						case s.AsyncEvents <- AsyncEvent{Topic: top, Payload: msg}:
+						case <-s.closeCh:
+							return
+						}
+					case <-s.closeCh:
+						return
+					}
 				}
 			}(ch, t)
 		}
@@ -184,34 +208,55 @@ func NewSession(cfg SessionConfig) (*Session, error) {
 
 // CreateCheckpoint captures a shadow git snapshot of the current working tree.
 func (s *Session) CreateCheckpoint(turn int, message string) (*git.Checkpoint, error) {
-	if s.CheckpointMgr == nil {
+	if s == nil || s.CheckpointMgr == nil {
 		return nil, nil
 	}
+	s.ckptMu.Lock()
+	defer s.ckptMu.Unlock()
 	return s.CheckpointMgr.CreateCheckpoint(turn, message)
 }
 
 // Rewind restores the working tree to the most recent checkpoint.
 func (s *Session) Rewind() (*git.Checkpoint, error) {
-	if s.CheckpointMgr == nil {
+	if s == nil || s.CheckpointMgr == nil {
 		return nil, fmt.Errorf("checkpoint manager not initialized")
 	}
+	s.ckptMu.Lock()
+	defer s.ckptMu.Unlock()
 	return s.CheckpointMgr.Rewind()
 }
 
-// Close cleans up event bus subscriptions and resources.
+// Close cleans up event bus subscriptions and resources idempotently.
 func (s *Session) Close() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.Config.EventBus != nil {
-		if s.SubCh != nil {
-			s.Config.EventBus.Unsubscribe("subagent_responses", s.SubID)
-			s.SubCh = nil
-		}
-		for topic, id := range s.subIDs {
-			s.Config.EventBus.Unsubscribe(topic, id)
-		}
-		s.subIDs = nil
+	if s == nil {
+		return
 	}
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return
+	}
+	s.closed = true
+	if s.closeCh != nil {
+		close(s.closeCh)
+	}
+	eb := s.Config.EventBus
+	subCh := s.SubCh
+	subID := s.SubID
+	subIDs := s.subIDs
+	s.SubCh = nil
+	s.subIDs = nil
+	s.mu.Unlock()
+
+	if eb != nil {
+		if subCh != nil {
+			eb.Unsubscribe("subagent_responses", subID)
+		}
+		for topic, id := range subIDs {
+			eb.Unsubscribe(topic, id)
+		}
+	}
+	s.subWg.Wait()
 }
 
 // GetState returns the current execution state thread-safely.
@@ -231,17 +276,46 @@ func (s *Session) SetState(st ExecutionState) {
 	}
 }
 
+func cloneMessage(m Message) Message {
+	out := m
+	if len(m.Images) > 0 {
+		out.Images = append([]string(nil), m.Images...)
+	}
+	if len(m.ToolCalls) > 0 {
+		out.ToolCalls = make([]ToolCall, len(m.ToolCalls))
+		for i, tc := range m.ToolCalls {
+			out.ToolCalls[i] = tc
+			if tc.Arguments != nil {
+				args := make(map[string]interface{}, len(tc.Arguments))
+				for k, v := range tc.Arguments {
+					args[k] = v
+				}
+				out.ToolCalls[i].Arguments = args
+			}
+		}
+	}
+	if m.Metadata != nil {
+		meta := make(map[string]string, len(m.Metadata))
+		for k, v := range m.Metadata {
+			meta[k] = v
+		}
+		out.Metadata = meta
+	}
+	return out
+}
+
 // AddMessage appends a message to the structured message list and synchronizes the conversation buffer.
 func (s *Session) AddMessage(msg Message) {
+	cloned := cloneMessage(msg)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if len(s.Messages) == 0 && msg.Role == RoleAssistant {
+	if len(s.Messages) == 0 && cloned.Role == RoleAssistant {
 		s.Conversation.WriteString("\nAgent: ")
-	} else if len(s.Messages) > 0 && s.Messages[len(s.Messages)-1].Role == RoleAssistant && msg.Role == RoleAssistant {
+	} else if len(s.Messages) > 0 && s.Messages[len(s.Messages)-1].Role == RoleAssistant && cloned.Role == RoleAssistant {
 		s.Conversation.WriteString("\nAgent: ")
 	}
-	s.Messages = append(s.Messages, msg)
-	s.Conversation.WriteString(msg.FormatText())
+	s.Messages = append(s.Messages, cloned)
+	s.Conversation.WriteString(cloned.FormatText())
 }
 
 // GetMessages returns a safe copy of the structured message history.
@@ -253,16 +327,21 @@ func (s *Session) GetMessages() []Message {
 		return ParseMessagesFromText(s.Conversation.String())
 	}
 	res := make([]Message, len(s.Messages))
-	copy(res, s.Messages)
+	for i, m := range s.Messages {
+		res[i] = cloneMessage(m)
+	}
 	return res
 }
 
 // SetMessages overwrites the structured messages and synchronizes the conversation buffer.
 func (s *Session) SetMessages(msgs []Message) {
+	cloned := make([]Message, len(msgs))
+	for i, m := range msgs {
+		cloned[i] = cloneMessage(m)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.Messages = make([]Message, len(msgs))
-	copy(s.Messages, msgs)
+	s.Messages = cloned
 	s.Conversation.Reset()
 	s.Conversation.WriteString(FormatMessages(s.Messages))
 }
@@ -282,8 +361,9 @@ func (s *Session) getAvailableToolsLocked() []mcp.Tool {
 	}
 	for _, client := range s.Config.MCPClients {
 		if client != nil {
-			tList, _ := client.ListTools()
-			availableTools = append(availableTools, tList...)
+			if tList, err := client.ListTools(); err == nil {
+				availableTools = append(availableTools, tList...)
+			}
 		}
 	}
 	return availableTools
@@ -325,8 +405,38 @@ func (s *Session) ClearHistory() {
 	history.ClearHistory()
 }
 
+func resolveLettaCoreMemory(configured string) string {
+	if configured != "" {
+		return configured
+	}
+	lettaCompiledCacheMu.RLock()
+	cached := lettaCompiledCache
+	lettaCompiledCacheMu.RUnlock()
+	if cached != "" {
+		return cached
+	}
+
+	lettaCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	coreMem := tools.GetCompiledLettaMemory(lettaCtx)
+	cancel()
+	if coreMem == "" {
+		coreMem = DefaultCoreMemory
+	}
+	lettaCompiledCacheMu.Lock()
+	lettaCompiledCache = coreMem
+	lettaCompiledCacheMu.Unlock()
+	return coreMem
+}
+
 // BuildSystemPrompt compiles directives, rules, tools, and skills into the active system instruction.
 func (s *Session) BuildSystemPrompt() string {
+	s.mu.RLock()
+	configuredCoreMem := s.Config.CoreMemory
+	s.mu.RUnlock()
+
+	// Resolve Letta memory without holding s.mu across potential 5s subprocess calls.
+	coreMem := resolveLettaCoreMemory(configuredCoreMem)
+
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -347,29 +457,6 @@ func (s *Session) BuildSystemPrompt() string {
 		sb.WriteString("\n[PLAN MODE ENFORCED]: You must create a detailed Markdown implementation plan with tasks and checkboxes before modifying code.\n")
 	}
 
-	// Inject Letta Core Memory blocks (<core_memory> containing <human>, <persona>, <scratchpad>)
-	var coreMem string
-	if s.Config.CoreMemory != "" {
-		coreMem = s.Config.CoreMemory
-	} else {
-		lettaCompiledCacheMu.RLock()
-		cached := lettaCompiledCache
-		lettaCompiledCacheMu.RUnlock()
-
-		if cached != "" {
-			coreMem = cached
-		} else {
-			lettaCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			coreMem = tools.GetCompiledLettaMemory(lettaCtx)
-			cancel()
-			if coreMem == "" {
-				coreMem = DefaultCoreMemory
-			}
-			lettaCompiledCacheMu.Lock()
-			lettaCompiledCache = coreMem
-			lettaCompiledCacheMu.Unlock()
-		}
-	}
 	if coreMem != "" {
 		sb.WriteString("\n" + strings.TrimSpace(coreMem) + "\n")
 	}

@@ -5,7 +5,6 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"testing"
 
 	"github.com/CmfH009/microgravity/internal/authutil"
@@ -171,8 +170,8 @@ func TestClient_Generate_429QuotaFallbackChain(t *testing.T) {
 func TestClient_Generate_VertexEndpoints(t *testing.T) {
 	// Temporarily set vertex mode in config
 	tempHome := t.TempDir()
-	os.Setenv("USERPROFILE", tempHome)
-	os.Setenv("HOME", tempHome)
+	t.Setenv("USERPROFILE", tempHome)
+	t.Setenv("HOME", tempHome)
 	config.SetVertexConfig("vertex-express", "", "us-central1", "vertex-express-test-key")
 
 	endpoint := authutil.BuildVertexEndpoint("express", "us-central1", "", "gemini-2.5-flash")
