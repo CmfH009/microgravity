@@ -7,7 +7,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/purav/microgravity/internal/mcp"
+	"github.com/CmfH009/microgravity/internal/mcp"
 )
 
 func TestClient_Generate(t *testing.T) {

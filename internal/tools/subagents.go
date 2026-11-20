@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/purav/microgravity/internal/events"
-	"github.com/purav/microgravity/internal/mcp"
-	"github.com/purav/microgravity/internal/subagent"
+	"github.com/CmfH009/microgravity/internal/events"
+	"github.com/CmfH009/microgravity/internal/mcp"
+	"github.com/CmfH009/microgravity/internal/subagent"
 )
 
 // RegisterSubagentTools registers multi-subagent orchestration and communication tools.

@@ -8,8 +8,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/purav/microgravity/internal/mcp"
-	"github.com/purav/microgravity/internal/vision"
+	"github.com/CmfH009/microgravity/internal/mcp"
+	"github.com/CmfH009/microgravity/internal/vision"
 )
 
 // RegisterVisionTools registers local Vision & Perception tools (YOLO, SAM, Depth, VLM).

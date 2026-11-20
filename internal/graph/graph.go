@@ -10,7 +10,7 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
-	"github.com/purav/microgravity/internal/skills"
+	"github.com/CmfH009/microgravity/internal/skills"
 )
 
 // PackageNode describes a Go package and its internal dependencies.
@@ -87,7 +87,7 @@ func BuildPackageGraph(rootDir string) (*GraphReport, error) {
 				pkgs = append(pkgs, PackageNode{
 					Name:       pkgName,
 					RelPath:    relPath,
-					ImportPath: "github.com/purav/microgravity/" + relPath,
+					ImportPath: "github.com/CmfH009/microgravity/" + relPath,
 					Imports:    impList,
 				})
 			}
@@ -170,7 +170,7 @@ func RenderLipGlossGraph(report *GraphReport, mode string) string {
 						impPrefix = "└── "
 					}
 					// Trim prefix for readability
-					shortImp := strings.TrimPrefix(imp, "github.com/purav/microgravity/")
+					shortImp := strings.TrimPrefix(imp, "github.com/CmfH009/microgravity/")
 					sb.WriteString(fmt.Sprintf("%s%s%s\n", childIndent, impPrefix, depStyle.Render(shortImp)))
 				}
 			}

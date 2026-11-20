@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/purav/microgravity/internal/rag"
+	"github.com/CmfH009/microgravity/internal/rag"
 )
 
 type Indexer struct {

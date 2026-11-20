@@ -9,8 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/purav/microgravity/internal/mcp"
-	"github.com/purav/microgravity/internal/sidecar"
+	"github.com/CmfH009/microgravity/internal/mcp"
+	"github.com/CmfH009/microgravity/internal/sidecar"
 )
 
 // RegisterLettaMemoryTools registers Letta-style hierarchical and episodic memory tools.

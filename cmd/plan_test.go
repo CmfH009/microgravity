@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/purav/microgravity/internal/plan"
+	"github.com/CmfH009/microgravity/internal/plan"
 )
 
 func TestPlanCommands(t *testing.T) {

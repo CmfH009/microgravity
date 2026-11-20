@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/purav/microgravity/internal/events"
+	"github.com/CmfH009/microgravity/internal/events"
 )
 
 type SubagentProfile string

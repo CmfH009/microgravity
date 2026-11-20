@@ -9,9 +9,9 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/purav/microgravity/internal/engine"
-	"github.com/purav/microgravity/internal/mcp"
-	"github.com/purav/microgravity/internal/tools"
+	"github.com/CmfH009/microgravity/internal/engine"
+	"github.com/CmfH009/microgravity/internal/mcp"
+	"github.com/CmfH009/microgravity/internal/tools"
 )
 
 // TestAdversarial_DualModeExecutionAndFallback stresses turn.go execution across:

@@ -24,7 +24,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/purav/microgravity/internal/logger"
+	"github.com/CmfH009/microgravity/internal/logger"
 )
 
 // ErrExceeded is returned by Check when a hard daily limit has been reached.

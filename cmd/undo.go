@@ -5,7 +5,7 @@ import (
 	"os"
 	"strconv"
 
-	"github.com/purav/microgravity/internal/journal"
+	"github.com/CmfH009/microgravity/internal/journal"
 	"github.com/spf13/cobra"
 )
 

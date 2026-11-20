@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/purav/microgravity/internal/events"
+	"github.com/CmfH009/microgravity/internal/events"
 )
 
 func TestTaskManagerSynchronousExecution(t *testing.T) {

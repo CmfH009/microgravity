@@ -7,7 +7,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/purav/microgravity/internal/config"
+	"github.com/CmfH009/microgravity/internal/config"
 )
 
 type model struct {

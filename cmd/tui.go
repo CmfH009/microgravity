@@ -11,13 +11,13 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/purav/microgravity/internal/config"
-	"github.com/purav/microgravity/internal/engine"
-	"github.com/purav/microgravity/internal/history"
-	"github.com/purav/microgravity/internal/lock"
-	"github.com/purav/microgravity/internal/ollama"
-	"github.com/purav/microgravity/internal/ui"
-	"github.com/purav/microgravity/internal/updater"
+	"github.com/CmfH009/microgravity/internal/config"
+	"github.com/CmfH009/microgravity/internal/engine"
+	"github.com/CmfH009/microgravity/internal/history"
+	"github.com/CmfH009/microgravity/internal/lock"
+	"github.com/CmfH009/microgravity/internal/ollama"
+	"github.com/CmfH009/microgravity/internal/ui"
+	"github.com/CmfH009/microgravity/internal/updater"
 	"github.com/spf13/cobra"
 )
 

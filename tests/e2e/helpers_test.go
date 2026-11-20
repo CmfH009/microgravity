@@ -9,11 +9,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/purav/microgravity/internal/events"
-	"github.com/purav/microgravity/internal/policy"
-	"github.com/purav/microgravity/internal/scheduler"
-	"github.com/purav/microgravity/internal/subagent"
-	"github.com/purav/microgravity/internal/tools"
+	"github.com/CmfH009/microgravity/internal/events"
+	"github.com/CmfH009/microgravity/internal/policy"
+	"github.com/CmfH009/microgravity/internal/scheduler"
+	"github.com/CmfH009/microgravity/internal/subagent"
+	"github.com/CmfH009/microgravity/internal/tools"
 )
 
 // initGitRepo initializes an isolated temporary Git repository with an initial commit.

@@ -9,9 +9,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/purav/microgravity/internal/cloud"
-	"github.com/purav/microgravity/internal/ollama"
-	"github.com/purav/microgravity/internal/router"
+	"github.com/CmfH009/microgravity/internal/cloud"
+	"github.com/CmfH009/microgravity/internal/ollama"
+	"github.com/CmfH009/microgravity/internal/router"
 	"github.com/spf13/cobra"
 )
 

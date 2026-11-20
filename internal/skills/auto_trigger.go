@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/purav/microgravity/internal/ui"
+	"github.com/CmfH009/microgravity/internal/ui"
 )
 
 // AutoRecommend inspects prompt text and returns top recommended skill matches.

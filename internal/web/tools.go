@@ -6,8 +6,8 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/purav/microgravity/internal/mcp"
-	"github.com/purav/microgravity/internal/tools"
+	"github.com/CmfH009/microgravity/internal/mcp"
+	"github.com/CmfH009/microgravity/internal/tools"
 )
 
 // RegisterWebTools registers the web-related native tools.

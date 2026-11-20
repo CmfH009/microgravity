@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/purav/microgravity/internal/pruner"
+	"github.com/CmfH009/microgravity/internal/pruner"
 )
 
 // ============================================================================

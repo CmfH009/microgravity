@@ -8,7 +8,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/purav/microgravity/internal/mcp"
+	"github.com/CmfH009/microgravity/internal/mcp"
 )
 
 // TestAdversarial_SchemaMappingEdgeCases stresses MCPToGeminiTools with adversarial

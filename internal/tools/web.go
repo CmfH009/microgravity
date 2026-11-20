@@ -10,7 +10,7 @@ import (
 	"strings"
 
 	md "github.com/JohannesKaufmann/html-to-markdown"
-	"github.com/purav/microgravity/internal/mcp"
+	"github.com/CmfH009/microgravity/internal/mcp"
 )
 
 // RegisterWebTools registers search_web and read_url_content tools.

@@ -6,8 +6,8 @@ import (
 	"os"
 	"strings"
 
-	"github.com/purav/microgravity/internal/ui"
-	"github.com/purav/microgravity/internal/vision"
+	"github.com/CmfH009/microgravity/internal/ui"
+	"github.com/CmfH009/microgravity/internal/vision"
 	"github.com/spf13/cobra"
 )
 

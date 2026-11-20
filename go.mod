@@ -1,4 +1,4 @@
-module github.com/purav/microgravity
+module github.com/CmfH009/microgravity
 
 go 1.26.4
 

@@ -5,7 +5,7 @@ import (
 	"fmt"
 
 	"github.com/charmbracelet/lipgloss"
-	"github.com/purav/microgravity/internal/ollama"
+	"github.com/CmfH009/microgravity/internal/ollama"
 	"github.com/shirou/gopsutil/v3/mem"
 )
 

@@ -7,7 +7,7 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
-	"github.com/purav/microgravity/internal/ui"
+	"github.com/CmfH009/microgravity/internal/ui"
 )
 
 func ReadMultiLineInput() (string, error) {

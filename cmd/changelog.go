@@ -3,7 +3,7 @@ package cmd
 import (
 	"fmt"
 
-	"github.com/purav/microgravity/internal/changelog"
+	"github.com/CmfH009/microgravity/internal/changelog"
 	"github.com/spf13/cobra"
 )
 

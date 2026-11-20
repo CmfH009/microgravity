@@ -1,7 +1,7 @@
 package cmd
 
 import (
-	"github.com/purav/microgravity/internal/ui"
+	"github.com/CmfH009/microgravity/internal/ui"
 	"github.com/spf13/cobra"
 )
 

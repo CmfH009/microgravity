@@ -9,9 +9,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/purav/microgravity/internal/plan"
-	"github.com/purav/microgravity/internal/swarm"
-	"github.com/purav/microgravity/internal/ui"
+	"github.com/CmfH009/microgravity/internal/plan"
+	"github.com/CmfH009/microgravity/internal/swarm"
+	"github.com/CmfH009/microgravity/internal/ui"
 	"github.com/spf13/cobra"
 )
 

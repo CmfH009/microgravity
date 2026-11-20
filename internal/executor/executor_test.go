@@ -6,11 +6,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/purav/microgravity/internal/cmdparse"
-	"github.com/purav/microgravity/internal/events"
-	"github.com/purav/microgravity/internal/plan"
-	"github.com/purav/microgravity/internal/scheduler"
-	"github.com/purav/microgravity/internal/tools"
+	"github.com/CmfH009/microgravity/internal/cmdparse"
+	"github.com/CmfH009/microgravity/internal/events"
+	"github.com/CmfH009/microgravity/internal/plan"
+	"github.com/CmfH009/microgravity/internal/scheduler"
+	"github.com/CmfH009/microgravity/internal/tools"
 )
 
 func TestExecuteToolNative(t *testing.T) {

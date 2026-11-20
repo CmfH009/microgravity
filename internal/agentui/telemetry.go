@@ -9,12 +9,12 @@ import (
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
-	"github.com/purav/microgravity/internal/budget"
-	"github.com/purav/microgravity/internal/config"
-	"github.com/purav/microgravity/internal/rag"
-	"github.com/purav/microgravity/internal/sessions"
-	"github.com/purav/microgravity/internal/subagent"
-	"github.com/purav/microgravity/internal/ui"
+	"github.com/CmfH009/microgravity/internal/budget"
+	"github.com/CmfH009/microgravity/internal/config"
+	"github.com/CmfH009/microgravity/internal/rag"
+	"github.com/CmfH009/microgravity/internal/sessions"
+	"github.com/CmfH009/microgravity/internal/subagent"
+	"github.com/CmfH009/microgravity/internal/ui"
 )
 
 // TokenUsageStats holds LLM token usage and budget metrics.

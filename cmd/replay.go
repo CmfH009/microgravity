@@ -6,7 +6,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/purav/microgravity/internal/trajectory"
+	"github.com/CmfH009/microgravity/internal/trajectory"
 	"github.com/spf13/cobra"
 )
 

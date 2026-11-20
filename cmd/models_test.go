@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/purav/microgravity/internal/models"
+	"github.com/CmfH009/microgravity/internal/models"
 )
 
 func TestModelSwitcherValidation(t *testing.T) {

@@ -4,7 +4,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/purav/microgravity/internal/rag"
+	"github.com/CmfH009/microgravity/internal/rag"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

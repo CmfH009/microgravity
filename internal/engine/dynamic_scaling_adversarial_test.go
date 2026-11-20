@@ -6,13 +6,13 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/purav/microgravity/internal/events"
-	"github.com/purav/microgravity/internal/mcp"
-	"github.com/purav/microgravity/internal/models"
-	"github.com/purav/microgravity/internal/pruner"
-	"github.com/purav/microgravity/internal/rules"
-	"github.com/purav/microgravity/internal/skills"
-	"github.com/purav/microgravity/internal/tools"
+	"github.com/CmfH009/microgravity/internal/events"
+	"github.com/CmfH009/microgravity/internal/mcp"
+	"github.com/CmfH009/microgravity/internal/models"
+	"github.com/CmfH009/microgravity/internal/pruner"
+	"github.com/CmfH009/microgravity/internal/rules"
+	"github.com/CmfH009/microgravity/internal/skills"
+	"github.com/CmfH009/microgravity/internal/tools"
 )
 
 // TestAdversarial_DynamicContextScaling verifies that across all catalog models,

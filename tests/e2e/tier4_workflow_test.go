@@ -9,12 +9,12 @@ import (
 	"testing"
 	"time"
 
-	mgcontext "github.com/purav/microgravity/internal/context"
-	"github.com/purav/microgravity/internal/events"
-	"github.com/purav/microgravity/internal/git"
-	"github.com/purav/microgravity/internal/policy"
-	"github.com/purav/microgravity/internal/pruner"
-	"github.com/purav/microgravity/internal/subagent"
+	mgcontext "github.com/CmfH009/microgravity/internal/context"
+	"github.com/CmfH009/microgravity/internal/events"
+	"github.com/CmfH009/microgravity/internal/git"
+	"github.com/CmfH009/microgravity/internal/policy"
+	"github.com/CmfH009/microgravity/internal/pruner"
+	"github.com/CmfH009/microgravity/internal/subagent"
 )
 
 // ══════════════════════════════════════════════════════════════════

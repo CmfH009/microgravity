@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/purav/microgravity/internal/ollama"
+	"github.com/CmfH009/microgravity/internal/ollama"
 )
 
 type Daemon struct {

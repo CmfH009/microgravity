@@ -3,7 +3,7 @@ package cmd
 import (
 	"testing"
 
-	"github.com/purav/microgravity/internal/changelog"
+	"github.com/CmfH009/microgravity/internal/changelog"
 )
 
 func TestChangelogCmd(t *testing.T) {

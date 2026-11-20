@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/purav/microgravity/internal/budget"
-	"github.com/purav/microgravity/internal/config"
+	"github.com/CmfH009/microgravity/internal/budget"
+	"github.com/CmfH009/microgravity/internal/config"
 	"github.com/spf13/cobra"
 	"golang.org/x/oauth2"
 )

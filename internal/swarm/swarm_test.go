@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/purav/microgravity/internal/swarm"
+	"github.com/CmfH009/microgravity/internal/swarm"
 )
 
 func TestSwarmManager(t *testing.T) {

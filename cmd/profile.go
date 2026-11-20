@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/purav/microgravity/internal/profiler"
+	"github.com/CmfH009/microgravity/internal/profiler"
 	"github.com/spf13/cobra"
 )
 

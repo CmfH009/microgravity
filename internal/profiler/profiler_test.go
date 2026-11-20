@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/purav/microgravity/internal/profiler"
+	"github.com/CmfH009/microgravity/internal/profiler"
 )
 
 func TestProfilePackage(t *testing.T) {

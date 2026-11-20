@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/purav/microgravity/internal/tools"
+	"github.com/CmfH009/microgravity/internal/tools"
 )
 
 func TestRegisterWebTools(t *testing.T) {

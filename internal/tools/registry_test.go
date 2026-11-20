@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/purav/microgravity/internal/mcp"
+	"github.com/CmfH009/microgravity/internal/mcp"
 )
 
 func TestRegistry(t *testing.T) {

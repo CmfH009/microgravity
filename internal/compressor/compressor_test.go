@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/purav/microgravity/internal/compressor"
+	"github.com/CmfH009/microgravity/internal/compressor"
 )
 
 func TestCompressGoCode(t *testing.T) {

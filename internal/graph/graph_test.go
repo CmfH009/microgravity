@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/purav/microgravity/internal/graph"
+	"github.com/CmfH009/microgravity/internal/graph"
 )
 
 func TestBuildPackageGraph(t *testing.T) {
@@ -30,7 +30,7 @@ func TestBuildPackageGraph(t *testing.T) {
 
 import (
 	"fmt"
-	"github.com/purav/microgravity/pkgB"
+	"github.com/CmfH009/microgravity/pkgB"
 )
 
 func Hello() {
@@ -71,8 +71,8 @@ func TestRenderLipGlossGraphModes(t *testing.T) {
 		Packages: []graph.PackageNode{
 			{
 				Name:       "cmd",
-				ImportPath: "github.com/purav/microgravity/cmd",
-				Imports:    []string{"github.com/purav/microgravity/internal/config"},
+				ImportPath: "github.com/CmfH009/microgravity/cmd",
+				Imports:    []string{"github.com/CmfH009/microgravity/internal/config"},
 			},
 		},
 		Skills: []graph.SkillNode{

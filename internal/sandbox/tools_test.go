@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/purav/microgravity/internal/tools"
+	"github.com/CmfH009/microgravity/internal/tools"
 )
 
 func TestRegisterSandboxTools(t *testing.T) {

@@ -10,10 +10,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/purav/microgravity/internal/agents"
-	"github.com/purav/microgravity/internal/config"
-	"github.com/purav/microgravity/internal/history"
-	"github.com/purav/microgravity/internal/ui"
+	"github.com/CmfH009/microgravity/internal/agents"
+	"github.com/CmfH009/microgravity/internal/config"
+	"github.com/CmfH009/microgravity/internal/history"
+	"github.com/CmfH009/microgravity/internal/ui"
 	"github.com/spf13/cobra"
 )
 

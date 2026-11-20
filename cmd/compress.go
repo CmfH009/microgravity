@@ -7,7 +7,7 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
-	"github.com/purav/microgravity/internal/compressor"
+	"github.com/CmfH009/microgravity/internal/compressor"
 	"github.com/spf13/cobra"
 )
 

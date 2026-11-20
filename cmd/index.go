@@ -8,8 +8,8 @@ import (
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
-	"github.com/purav/microgravity/internal/indexer"
-	"github.com/purav/microgravity/internal/rag"
+	"github.com/CmfH009/microgravity/internal/indexer"
+	"github.com/CmfH009/microgravity/internal/rag"
 	"github.com/spf13/cobra"
 )
 

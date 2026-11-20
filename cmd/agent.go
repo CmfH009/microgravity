@@ -5,7 +5,7 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
-	"github.com/purav/microgravity/internal/agents"
+	"github.com/CmfH009/microgravity/internal/agents"
 	"github.com/spf13/cobra"
 )
 

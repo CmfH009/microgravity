@@ -6,8 +6,8 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
-	"github.com/purav/microgravity/internal/git"
-	"github.com/purav/microgravity/internal/ui"
+	"github.com/CmfH009/microgravity/internal/git"
+	"github.com/CmfH009/microgravity/internal/ui"
 	"github.com/spf13/cobra"
 )
 

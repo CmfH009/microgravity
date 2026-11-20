@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/purav/microgravity/internal/ui"
+	"github.com/CmfH009/microgravity/internal/ui"
 )
 
 // AutoFix runs an iterative repair loop with verification feedback to resolve failing workspace tests.

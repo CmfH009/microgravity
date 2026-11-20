@@ -8,9 +8,9 @@ import (
 	"os"
 	"testing"
 
-	"github.com/purav/microgravity/internal/authutil"
-	"github.com/purav/microgravity/internal/config"
-	"github.com/purav/microgravity/internal/mcp"
+	"github.com/CmfH009/microgravity/internal/authutil"
+	"github.com/CmfH009/microgravity/internal/config"
+	"github.com/CmfH009/microgravity/internal/mcp"
 )
 
 func TestClient_Generate(t *testing.T) {

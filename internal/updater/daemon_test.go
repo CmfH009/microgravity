@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/purav/microgravity/internal/ollama"
+	"github.com/CmfH009/microgravity/internal/ollama"
 )
 
 func TestDaemonStartStop(t *testing.T) {

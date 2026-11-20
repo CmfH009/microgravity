@@ -6,7 +6,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/purav/microgravity/internal/events"
+	"github.com/CmfH009/microgravity/internal/events"
 	"github.com/robfig/cron/v3"
 )
 

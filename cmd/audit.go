@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/purav/microgravity/internal/audit"
-	"github.com/purav/microgravity/internal/ui"
+	"github.com/CmfH009/microgravity/internal/audit"
+	"github.com/CmfH009/microgravity/internal/ui"
 	"github.com/spf13/cobra"
 )
 

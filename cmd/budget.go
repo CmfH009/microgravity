@@ -6,7 +6,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/purav/microgravity/internal/budget"
+	"github.com/CmfH009/microgravity/internal/budget"
 	"github.com/spf13/cobra"
 )
 

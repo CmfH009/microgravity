@@ -9,13 +9,13 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/purav/microgravity/internal/events"
-	"github.com/purav/microgravity/internal/mcp"
-	"github.com/purav/microgravity/internal/policy"
-	"github.com/purav/microgravity/internal/scheduler"
-	"github.com/purav/microgravity/internal/subagent"
-	"github.com/purav/microgravity/internal/tools"
-	"github.com/purav/microgravity/internal/web"
+	"github.com/CmfH009/microgravity/internal/events"
+	"github.com/CmfH009/microgravity/internal/mcp"
+	"github.com/CmfH009/microgravity/internal/policy"
+	"github.com/CmfH009/microgravity/internal/scheduler"
+	"github.com/CmfH009/microgravity/internal/subagent"
+	"github.com/CmfH009/microgravity/internal/tools"
+	"github.com/CmfH009/microgravity/internal/web"
 	"github.com/spf13/cobra"
 )
 

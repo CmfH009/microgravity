@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/purav/microgravity/internal/mcp"
-	"github.com/purav/microgravity/internal/scheduler"
+	"github.com/CmfH009/microgravity/internal/mcp"
+	"github.com/CmfH009/microgravity/internal/scheduler"
 )
 
 // RegisterScheduleTools registers timers, schedulers, and time querying tools.

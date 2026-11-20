@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/purav/microgravity/internal/graph"
+	"github.com/CmfH009/microgravity/internal/graph"
 	"github.com/spf13/cobra"
 )
 

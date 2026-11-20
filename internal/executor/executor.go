@@ -9,11 +9,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/purav/microgravity/internal/cmdparse"
-	"github.com/purav/microgravity/internal/mcp"
-	"github.com/purav/microgravity/internal/plan"
-	"github.com/purav/microgravity/internal/tools"
-	"github.com/purav/microgravity/internal/ui"
+	"github.com/CmfH009/microgravity/internal/cmdparse"
+	"github.com/CmfH009/microgravity/internal/mcp"
+	"github.com/CmfH009/microgravity/internal/plan"
+	"github.com/CmfH009/microgravity/internal/tools"
+	"github.com/CmfH009/microgravity/internal/ui"
 )
 
 type ToolExecutionResult struct {

@@ -6,9 +6,9 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/purav/microgravity/internal/cache"
-	"github.com/purav/microgravity/internal/mcp"
-	"github.com/purav/microgravity/internal/policy"
+	"github.com/CmfH009/microgravity/internal/cache"
+	"github.com/CmfH009/microgravity/internal/mcp"
+	"github.com/CmfH009/microgravity/internal/policy"
 )
 
 type ToolHandler func(ctx context.Context, args map[string]interface{}) (string, error)

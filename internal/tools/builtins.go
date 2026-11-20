@@ -10,13 +10,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/purav/microgravity/internal/events"
-	"github.com/purav/microgravity/internal/mcp"
-	"github.com/purav/microgravity/internal/policy"
-	"github.com/purav/microgravity/internal/rag"
-	"github.com/purav/microgravity/internal/scheduler"
-	"github.com/purav/microgravity/internal/subagent"
-	"github.com/purav/microgravity/internal/tasks"
+	"github.com/CmfH009/microgravity/internal/events"
+	"github.com/CmfH009/microgravity/internal/mcp"
+	"github.com/CmfH009/microgravity/internal/policy"
+	"github.com/CmfH009/microgravity/internal/rag"
+	"github.com/CmfH009/microgravity/internal/scheduler"
+	"github.com/CmfH009/microgravity/internal/subagent"
+	"github.com/CmfH009/microgravity/internal/tasks"
 )
 
 type ArtifactMetadata struct {

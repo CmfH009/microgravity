@@ -13,9 +13,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/purav/microgravity/internal/budget"
-	"github.com/purav/microgravity/internal/cmdparse"
-	"github.com/purav/microgravity/internal/mcp"
+	"github.com/CmfH009/microgravity/internal/budget"
+	"github.com/CmfH009/microgravity/internal/cmdparse"
+	"github.com/CmfH009/microgravity/internal/mcp"
 )
 
 var EnableDebug = false

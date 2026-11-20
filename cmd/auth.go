@@ -9,9 +9,9 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/purav/microgravity/internal/authutil"
-	"github.com/purav/microgravity/internal/config"
-	"github.com/purav/microgravity/internal/ui"
+	"github.com/CmfH009/microgravity/internal/authutil"
+	"github.com/CmfH009/microgravity/internal/config"
+	"github.com/CmfH009/microgravity/internal/ui"
 	"github.com/spf13/cobra"
 	"golang.org/x/oauth2"
 )

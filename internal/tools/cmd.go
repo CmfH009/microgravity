@@ -9,9 +9,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/purav/microgravity/internal/mcp"
-	"github.com/purav/microgravity/internal/policy"
-	"github.com/purav/microgravity/internal/tasks"
+	"github.com/CmfH009/microgravity/internal/mcp"
+	"github.com/CmfH009/microgravity/internal/policy"
+	"github.com/CmfH009/microgravity/internal/tasks"
 )
 
 // RegisterCmdTools registers command and background task tools.

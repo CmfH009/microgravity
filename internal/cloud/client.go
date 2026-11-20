@@ -15,11 +15,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/purav/microgravity/internal/authutil"
-	"github.com/purav/microgravity/internal/budget"
-	"github.com/purav/microgravity/internal/cmdparse"
-	"github.com/purav/microgravity/internal/config"
-	"github.com/purav/microgravity/internal/mcp"
+	"github.com/CmfH009/microgravity/internal/authutil"
+	"github.com/CmfH009/microgravity/internal/budget"
+	"github.com/CmfH009/microgravity/internal/cmdparse"
+	"github.com/CmfH009/microgravity/internal/config"
+	"github.com/CmfH009/microgravity/internal/mcp"
 )
 
 type Client struct {

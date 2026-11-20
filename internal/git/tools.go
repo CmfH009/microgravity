@@ -8,8 +8,8 @@ import (
 	"path/filepath"
 	
 	"github.com/google/go-github/v62/github"
-	"github.com/purav/microgravity/internal/mcp"
-	"github.com/purav/microgravity/internal/tools"
+	"github.com/CmfH009/microgravity/internal/mcp"
+	"github.com/CmfH009/microgravity/internal/tools"
 )
 
 // RegisterGitTools registers git and github tools with the registry.

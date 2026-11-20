@@ -5,7 +5,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/purav/microgravity/internal/pruner"
+	"github.com/CmfH009/microgravity/internal/pruner"
 )
 
 // MessageRole defines the participant role in a conversation turn.

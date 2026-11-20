@@ -6,9 +6,9 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
-	"github.com/purav/microgravity/internal/config"
-	"github.com/purav/microgravity/internal/ollama"
-	"github.com/purav/microgravity/internal/subagent"
+	"github.com/CmfH009/microgravity/internal/config"
+	"github.com/CmfH009/microgravity/internal/ollama"
+	"github.com/CmfH009/microgravity/internal/subagent"
 	"github.com/shirou/gopsutil/v3/mem"
 	"github.com/spf13/cobra"
 )

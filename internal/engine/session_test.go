@@ -9,12 +9,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/purav/microgravity/internal/engine"
-	"github.com/purav/microgravity/internal/events"
-	"github.com/purav/microgravity/internal/mcp"
-	"github.com/purav/microgravity/internal/rules"
-	"github.com/purav/microgravity/internal/skills"
-	"github.com/purav/microgravity/internal/tools"
+	"github.com/CmfH009/microgravity/internal/engine"
+	"github.com/CmfH009/microgravity/internal/events"
+	"github.com/CmfH009/microgravity/internal/mcp"
+	"github.com/CmfH009/microgravity/internal/rules"
+	"github.com/CmfH009/microgravity/internal/skills"
+	"github.com/CmfH009/microgravity/internal/tools"
 )
 
 func TestNewSession_Defaults(t *testing.T) {

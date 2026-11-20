@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/purav/microgravity/internal/rag"
-	"github.com/purav/microgravity/internal/subagent"
+	"github.com/CmfH009/microgravity/internal/rag"
+	"github.com/CmfH009/microgravity/internal/subagent"
 )
 
 func TestRenderSubagentHeader(t *testing.T) {

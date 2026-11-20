@@ -11,11 +11,11 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/purav/microgravity/internal/journal"
-	"github.com/purav/microgravity/internal/mcp"
-	"github.com/purav/microgravity/internal/policy"
-	"github.com/purav/microgravity/internal/preview"
-	"github.com/purav/microgravity/internal/secrets"
+	"github.com/CmfH009/microgravity/internal/journal"
+	"github.com/CmfH009/microgravity/internal/mcp"
+	"github.com/CmfH009/microgravity/internal/policy"
+	"github.com/CmfH009/microgravity/internal/preview"
+	"github.com/CmfH009/microgravity/internal/secrets"
 )
 
 var errLimitReached = errors.New("search limit reached")

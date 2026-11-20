@@ -9,7 +9,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/purav/microgravity/internal/config"
+	"github.com/CmfH009/microgravity/internal/config"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 )

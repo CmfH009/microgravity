@@ -3,7 +3,7 @@ package cmd
 import (
 	"fmt"
 
-	"github.com/purav/microgravity/internal/ci"
+	"github.com/CmfH009/microgravity/internal/ci"
 	"github.com/spf13/cobra"
 )
 

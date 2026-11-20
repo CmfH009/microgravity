@@ -7,8 +7,8 @@ import (
 	"os"
 	"sync"
 
-	"github.com/purav/microgravity/internal/engine"
-	"github.com/purav/microgravity/internal/swarm"
+	"github.com/CmfH009/microgravity/internal/engine"
+	"github.com/CmfH009/microgravity/internal/swarm"
 	"github.com/spf13/cobra"
 )
 

@@ -8,8 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/purav/microgravity/internal/memory"
-	"github.com/purav/microgravity/internal/rag"
+	"github.com/CmfH009/microgravity/internal/memory"
+	"github.com/CmfH009/microgravity/internal/rag"
 	"github.com/spf13/cobra"
 )
 

@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/purav/microgravity/internal/rag"
+	"github.com/CmfH009/microgravity/internal/rag"
 )
 
 func TestIndexer_IndexAndQuery(t *testing.T) {

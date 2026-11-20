@@ -7,9 +7,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/purav/microgravity/internal/events"
-	"github.com/purav/microgravity/internal/rag"
-	"github.com/purav/microgravity/internal/scheduler"
+	"github.com/CmfH009/microgravity/internal/events"
+	"github.com/CmfH009/microgravity/internal/rag"
+	"github.com/CmfH009/microgravity/internal/scheduler"
 )
 
 func setupTestRegistry(t *testing.T) (*Registry, context.Context, func()) {

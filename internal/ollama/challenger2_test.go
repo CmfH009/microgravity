@@ -7,7 +7,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/purav/microgravity/internal/mcp"
+	"github.com/CmfH009/microgravity/internal/mcp"
 )
 
 // TestChallenger2_OllamaSchema_EdgeCases stresses MCPToOllamaTools with

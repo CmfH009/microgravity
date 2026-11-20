@@ -10,7 +10,7 @@ import (
 	"strings"
 
 	"github.com/mattn/go-isatty"
-	"github.com/purav/microgravity/internal/mcp"
+	"github.com/CmfH009/microgravity/internal/mcp"
 )
 
 // RegisterUIArtifactTools registers ask_question and generate_image tools.
