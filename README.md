@@ -1,8 +1,13 @@
 # Microgravity (`mg`) 🌌
 
+[![CI](https://github.com/CmfH009/microgravity/actions/workflows/ci.yml/badge.svg)](https://github.com/CmfH009/microgravity/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/CmfH009/microgravity)](https://github.com/CmfH009/microgravity/releases)
+[![Go Version](https://img.shields.io/github/go-mod/go-version/CmfH009/microgravity)](https://github.com/CmfH009/microgravity/blob/master/go.mod)
+[![License: MIT](https://img.shields.io/github/license/CmfH009/microgravity)](https://github.com/CmfH009/microgravity/blob/master/LICENSE)
+
 **Microgravity** (`mg`) is an autonomous AI agent CLI and execution environment driven by local (Ollama/Gemma) and cloud-routed (Gemini/Gemma) LLM model architectures, providing full parity with the Google Antigravity (`agy`) CLI ecosystem.
 
-> **Status:** Active development. Run `go test ./...`, `go vet ./...`, and `go build ./...` locally before release.
+> **Status:** Active development. Run `go test -race ./...`, `go vet ./...`, and `go build ./...` locally before release.
 
 ---
 
@@ -85,11 +90,45 @@
 
 ## 📦 Build & Installation
 
-```bash
-# Optimized binary build
-go build -ldflags="-s -w" -o mg.exe main.go
-go build -ldflags="-s -w" -o microgravity.exe main.go
+### Install via Go
 
-# Install globally to Go bin
-go install .
+```bash
+go install github.com/CmfH009/microgravity@latest
 ```
+
+### Local & Cross-Platform Builds
+
+```bash
+# Build from source in repository root
+go build -ldflags="-s -w" -o mg .
+
+# Cross-compile static binaries (CGO_ENABLED=0)
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o dist/mg-linux-amd64 .
+CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o dist/mg-windows-amd64.exe .
+CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -ldflags="-s -w" -o dist/mg-darwin-arm64 .
+```
+
+On Windows PowerShell:
+
+```powershell
+$env:CGO_ENABLED="0"; $env:GOOS="windows"; $env:GOARCH="amd64"; go build -ldflags="-s -w" -o dist/mg-windows-amd64.exe .
+```
+
+### Verification & Tests
+
+```bash
+go vet ./...
+go test -race ./...
+```
+
+---
+
+## ⚙️ Portable Sidecar Discovery
+
+Python sidecar integrations (such as browser automation and Letta memory tools) locate the Python runtime and sidecar scripts dynamically without hardcoded paths:
+
+| Variable | Purpose | Resolution Order |
+| :--- | :--- | :--- |
+| `MG_PYTHON` | Python interpreter path or command name | `MG_PYTHON` -> `VIRTUAL_ENV` -> local `.venv` (cwd or executable directory) -> system `PATH` -> `"python"` |
+| `MG_SIDECAR_DIR` | Explicit directory containing sidecar scripts | Checked directly first (`<relPath>` / `<fallbackName>`), then `python/` and `scripts/` subdirectories (does not walk parent directories) |
+| `MG_HOME` | Base Microgravity installation directory | Checked after `MG_SIDECAR_DIR` (in `python/`, root, and `scripts/`), before falling back to cwd, executable directory, and up to 4 parent directories |
