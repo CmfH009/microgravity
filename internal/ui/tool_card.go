@@ -3,6 +3,7 @@ package ui
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -48,8 +49,70 @@ var (
 			Bold(true)
 
 	ToolValStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("255"))
+			Foreground(RoleColor(RoleText))
 )
+
+type toolCardPalette struct {
+	boxSuccess   lipgloss.Style
+	boxFailed    lipgloss.Style
+	header       lipgloss.Style
+	badgeSuccess lipgloss.Style
+	badgeFailed  lipgloss.Style
+	meta         lipgloss.Style
+	key          lipgloss.Style
+	val          lipgloss.Style
+}
+
+func currentToolCardPalette() toolCardPalette {
+	successColor := RoleColor(RoleSuccess)
+	errorColor := RoleColor(RoleError)
+	return toolCardPalette{
+		boxSuccess: lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(successColor).
+			Padding(0, 1).
+			MarginTop(0).
+			MarginBottom(1),
+		boxFailed: lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(errorColor).
+			Padding(0, 1).
+			MarginTop(0).
+			MarginBottom(1),
+		header: lipgloss.NewStyle().
+			Foreground(RoleColor(RoleHighlight)).
+			Bold(true),
+		badgeSuccess: lipgloss.NewStyle().
+			Foreground(lipgloss.Color("15")).
+			Background(successColor).
+			Bold(true).
+			Padding(0, 1),
+		badgeFailed: lipgloss.NewStyle().
+			Foreground(lipgloss.Color("15")).
+			Background(errorColor).
+			Bold(true).
+			Padding(0, 1),
+		meta: lipgloss.NewStyle().
+			Foreground(RoleColor(RoleTextMuted)),
+		key: lipgloss.NewStyle().
+			Foreground(RoleColor(RoleAccent)).
+			Bold(true),
+		val: lipgloss.NewStyle().
+			Foreground(RoleColor(RoleText)),
+	}
+}
+
+func refreshToolCardStyles() {
+	p := currentToolCardPalette()
+	ToolCardBoxSuccess = p.boxSuccess
+	ToolCardBoxFailed = p.boxFailed
+	ToolHeaderStyle = p.header
+	ToolBadgeSuccess = p.badgeSuccess
+	ToolBadgeFailed = p.badgeFailed
+	ToolMetaStyle = p.meta
+	ToolKeyStyle = p.key
+	ToolValStyle = p.val
+}
 
 func getToolIcon(toolName string) string {
 	switch {
@@ -70,44 +133,76 @@ func getToolIcon(toolName string) string {
 	}
 }
 
-// RenderToolCallCard renders an Antigravity-style tool call card.
+// RenderToolCallCard renders an Antigravity-style tool call card in expanded mode.
 func RenderToolCallCard(toolName string, args map[string]interface{}, duration time.Duration, success bool, output string) string {
-	var sb strings.Builder
+	return RenderCollapsibleToolCard(toolName, args, duration, success, output, true)
+}
 
+// RenderCollapsibleToolCard renders a tool call card either as a compact 1-line bordered
+// summary (expanded == false) or with full parameters and output preview (expanded == true).
+// All styles are resolved dynamically from RoleColor at render time.
+func RenderCollapsibleToolCard(toolName string, args map[string]interface{}, duration time.Duration, success bool, output string, expanded bool) string {
+	pal := currentToolCardPalette()
 	icon := getToolIcon(toolName)
-	statusText := ToolBadgeSuccess.Render("SUCCESS") + ToolMetaStyle.Render(fmt.Sprintf(" ⏱ %v", duration))
+
+	statusBadge := pal.badgeSuccess.Render("SUCCESS")
 	if !success {
-		statusText = ToolBadgeFailed.Render("FAILED") + ToolMetaStyle.Render(fmt.Sprintf(" ⏱ %v", duration))
+		statusBadge = pal.badgeFailed.Render("FAILED")
+	}
+	durationText := pal.meta.Render(fmt.Sprintf("⏱ %v", duration))
+
+	box := pal.boxSuccess
+	if !success {
+		box = pal.boxFailed
 	}
 
-	header := fmt.Sprintf("%s %s   %s", icon, ToolHeaderStyle.Render(toolName), statusText)
+	if !expanded {
+		summaryParts := make([]string, 0, 2)
+		if len(args) > 0 {
+			summaryParts = append(summaryParts, fmt.Sprintf("%d arg(s)", len(args)))
+		}
+		trimmedOut := strings.TrimSpace(output)
+		if trimmedOut != "" {
+			lineCount := len(strings.Split(trimmedOut, "\n"))
+			summaryParts = append(summaryParts, fmt.Sprintf("%d line(s)", lineCount))
+		}
+		metaSummary := ""
+		if len(summaryParts) > 0 {
+			metaSummary = "  " + pal.meta.Render("("+strings.Join(summaryParts, ", ")+")")
+		}
+		compactLine := fmt.Sprintf("▸ %s %s  %s %s%s", icon, pal.header.Render(toolName), statusBadge, durationText, metaSummary)
+		return box.Render(compactLine)
+	}
+
+	var sb strings.Builder
+	header := fmt.Sprintf("▾ %s %s   %s %s", icon, pal.header.Render(toolName), statusBadge, durationText)
 	sb.WriteString(header + "\n")
 
-	// Render args neatly
 	if len(args) > 0 {
-		sb.WriteString(ToolMetaStyle.Render("Parameters:") + "\n")
-		for k, v := range args {
-			vBytes, _ := json.Marshal(v)
-			sb.WriteString(fmt.Sprintf("  • %s: %s\n", ToolKeyStyle.Render(k), ToolValStyle.Render(string(vBytes))))
+		sb.WriteString(pal.meta.Render("Parameters:") + "\n")
+		keys := make([]string, 0, len(args))
+		for k := range args {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			vBytes, _ := json.Marshal(args[k])
+			sb.WriteString(fmt.Sprintf("  • %s: %s\n", pal.key.Render(k), pal.val.Render(string(vBytes))))
 		}
 	}
 
-	// Output preview (truncated if too long)
 	if output != "" {
-		sb.WriteString(ToolMetaStyle.Render("Output Preview:") + "\n")
+		sb.WriteString(pal.meta.Render("Output Preview:") + "\n")
 		lines := strings.Split(strings.TrimSpace(output), "\n")
 		maxLines := 6
 		if len(lines) > maxLines {
 			preview := strings.Join(lines[:maxLines], "\n")
-			sb.WriteString(preview + "\n" + ToolMetaStyle.Render(fmt.Sprintf("... (%d lines truncated)", len(lines)-maxLines)))
+			sb.WriteString(preview + "\n" + pal.meta.Render(fmt.Sprintf("... (%d lines truncated)", len(lines)-maxLines)))
 		} else {
 			sb.WriteString(strings.Join(lines, "\n"))
 		}
 	}
 
-	if success {
-		return ToolCardBoxSuccess.Render(sb.String())
-	}
-	return ToolCardBoxFailed.Render(sb.String())
+	return box.Render(strings.TrimRight(sb.String(), "\n"))
 }
 

@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/charmbracelet/lipgloss"
@@ -144,4 +145,66 @@ func TestMinMax(t *testing.T) {
 	min, max := minMax([]int{3, 1, 4, 1, 5, 9, 2, 6})
 	assert.Equal(t, 1, min)
 	assert.Equal(t, 9, max)
+}
+
+func TestThemeNamesAndAllThemes(t *testing.T) {
+	defer SetTheme("dark")
+
+	names := ThemeNames()
+	assert.Equal(t, []string{"dark", "light", "tokyo-night", "catppuccin", "high-contrast"}, names)
+
+	roles := []ThemeRole{
+		RolePrimary, RoleSuccess, RoleAccent, RoleBrand,
+		RoleHighlight, RoleSeparator, RoleSystem, RoleError,
+		RoleText, RoleTextMuted,
+	}
+
+	for _, name := range names {
+		SetTheme(name)
+		assert.Equal(t, name, CurrentTheme.Name)
+		assert.Equal(t, name, ActiveThemeName())
+		for _, r := range roles {
+			assert.NotEmpty(t, string(RoleColor(r)), "role %s empty in theme %s", r, name)
+		}
+		assert.Equal(t, RoleColor(RolePrimary), ColorCyan)
+		assert.Equal(t, RoleColor(RoleSuccess), ColorMint)
+		assert.Equal(t, RoleColor(RoleTextMuted), ColorMuted)
+
+		assert.Contains(t, PrintHeader("MICROGRAVITY"), "MICROGRAVITY")
+		assert.Contains(t, PrintError(errors.New("boom")), "boom")
+		assert.Contains(t, RenderStatusLine("gemma:2b", 2, 1, "/tmp"), "gemma:2b")
+	}
+}
+
+func TestExtendedThemePalettes(t *testing.T) {
+	defer SetTheme("dark")
+
+	SetTheme("tokyo-night")
+	assert.Equal(t, TokyoNightTheme.Primary, RoleColor(RolePrimary))
+	assert.Equal(t, TokyoNightTheme.Error, RoleColor(RoleError))
+
+	SetTheme("catppuccin")
+	assert.Equal(t, CatppuccinTheme.Primary, RoleColor(RolePrimary))
+	assert.Equal(t, CatppuccinTheme.Brand, RoleColor(RoleBrand))
+
+	SetTheme("high-contrast")
+	assert.Equal(t, HighContrastTheme.Primary, RoleColor(RolePrimary))
+	assert.Equal(t, HighContrastTheme.Text, RoleColor(RoleText))
+}
+
+func TestAutoDetectTheme(t *testing.T) {
+	defer func() {
+		lipgloss.SetHasDarkBackground(true)
+		SetTheme("dark")
+	}()
+
+	lipgloss.SetHasDarkBackground(true)
+	assert.Equal(t, "dark", AutoDetectTheme())
+	SetTheme("auto")
+	assert.Equal(t, "dark", ActiveThemeName())
+
+	lipgloss.SetHasDarkBackground(false)
+	assert.Equal(t, "light", AutoDetectTheme())
+	SetTheme("auto")
+	assert.Equal(t, "light", ActiveThemeName())
 }
