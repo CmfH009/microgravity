@@ -114,13 +114,15 @@ type GeminiSchema struct {
 }
 
 type GeminiFunctionDeclaration struct {
-	Name        string        `json:"name"`
-	Description string        `json:"description"`
-	Parameters  *GeminiSchema `json:"parameters,omitempty"`
+	Name         string        `json:"name"`
+	Description  string        `json:"description"`
+	Parameters   *GeminiSchema `json:"parameters,omitempty"`
+	DeferLoading bool          `json:"defer_loading,omitempty"`
 }
 
 type GeminiTool struct {
 	FunctionDeclarations []GeminiFunctionDeclaration `json:"functionDeclarations,omitempty"`
+	Type                 string                      `json:"type,omitempty"`
 }
 
 type GenerateRequest struct {
@@ -166,18 +168,34 @@ func estimateTokens(s string) int {
 
 // MCPToGeminiTools converts MCP tool definitions to Gemini API function declarations.
 func MCPToGeminiTools(tools []mcp.Tool) []GeminiTool {
+	return MCPToGeminiToolsWithRetrieval(tools, nil)
+}
+
+// MCPToGeminiToolsWithRetrieval converts MCP tool definitions and marks non-core tools with
+// defer_loading: true plus a tool_search entry when coreTools is provided and non-empty.
+func MCPToGeminiToolsWithRetrieval(tools []mcp.Tool, coreTools map[string]bool) []GeminiTool {
 	if len(tools) == 0 {
 		return nil
 	}
 	var decls []GeminiFunctionDeclaration
+	hasDeferred := false
 	for _, t := range tools {
+		deferLoad := len(coreTools) > 0 && !coreTools[t.Name]
+		if deferLoad {
+			hasDeferred = true
+		}
 		decls = append(decls, GeminiFunctionDeclaration{
-			Name:        t.Name,
-			Description: t.Description,
-			Parameters:  mcpSchemaToGeminiSchema(t.InputSchema),
+			Name:         t.Name,
+			Description:  t.Description,
+			Parameters:   mcpSchemaToGeminiSchema(t.InputSchema),
+			DeferLoading: deferLoad,
 		})
 	}
-	return []GeminiTool{{FunctionDeclarations: decls}}
+	res := []GeminiTool{{FunctionDeclarations: decls}}
+	if hasDeferred {
+		res = append(res, GeminiTool{Type: "tool_search"})
+	}
+	return res
 }
 
 var mcpToGeminiTools = MCPToGeminiTools

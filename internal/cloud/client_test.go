@@ -289,6 +289,28 @@ func TestClient_GenerateWithTools_NativeFunctionCall(t *testing.T) {
 	}
 }
 
+func TestMCPToGeminiToolsWithRetrieval(t *testing.T) {
+	tools := []mcp.Tool{
+		{Name: "read_file", Description: "Read a file", InputSchema: mcp.Schema{Type: "object"}},
+		{Name: "deep_scan", Description: "Run deep scan", InputSchema: mcp.Schema{Type: "object"}},
+	}
+	core := map[string]bool{"read_file": true}
+	converted := MCPToGeminiToolsWithRetrieval(tools, core)
+	if len(converted) != 2 {
+		t.Fatalf("expected 2 tool entries (declarations + tool_search), got %d", len(converted))
+	}
+	decls := converted[0].FunctionDeclarations
+	if decls[0].DeferLoading {
+		t.Errorf("expected core tool read_file not to have defer_loading=true")
+	}
+	if !decls[1].DeferLoading {
+		t.Errorf("expected non-core tool deep_scan to have defer_loading=true")
+	}
+	if converted[1].Type != "tool_search" {
+		t.Errorf("expected second entry type 'tool_search', got %q", converted[1].Type)
+	}
+}
+
 
 
 
