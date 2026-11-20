@@ -46,7 +46,7 @@ func newDefaultHTTPClient() *http.Client {
 			Timeout:   15 * time.Second,
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
-		ResponseHeaderTimeout: 45 * time.Second,
+		ResponseHeaderTimeout: 3 * time.Minute,
 		IdleConnTimeout:       90 * time.Second,
 		MaxIdleConns:          32,
 		MaxIdleConnsPerHost:   8,
