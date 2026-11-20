@@ -24,7 +24,9 @@ type Error struct {
 
 // MCP Specifics
 type InitializeParams struct {
-	ClientInfo ClientInfo `json:"clientInfo"`
+	ProtocolVersion string                 `json:"protocolVersion,omitempty"`
+	Capabilities    map[string]interface{} `json:"capabilities,omitempty"`
+	ClientInfo      ClientInfo             `json:"clientInfo"`
 }
 
 type ClientInfo struct {

@@ -4,12 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/CmfH009/microgravity/internal/events"
 	"github.com/CmfH009/microgravity/internal/mcp"
 	"github.com/CmfH009/microgravity/internal/subagent"
 )
+
+var subagentIDSeq atomic.Uint64
 
 // RegisterSubagentTools registers multi-subagent orchestration and communication tools.
 func RegisterSubagentTools(r *Registry, subMgr *subagent.Manager, eb *events.EventBus) {
@@ -73,9 +76,13 @@ func RegisterSubagentTools(r *Registry, subMgr *subagent.Manager, eb *events.Eve
 				workspace = subagent.WorkspaceShare
 			}
 
-			id := fmt.Sprintf("sub-%d-%d", time.Now().UnixNano()%1000000, len(spawned)+1)
+			seq := subagentIDSeq.Add(1)
+			id := fmt.Sprintf("sub-%d-%d", time.Now().UnixNano(), seq)
 			info, err := subMgr.Spawn(ctx, id, role, subagent.SubagentProfile(typeName), prompt, model, workspace, nil)
 			if err != nil {
+				for _, prev := range spawned {
+					subMgr.Kill(prev.ConversationID)
+				}
 				return "", fmt.Errorf("failed to spawn subagent [%s]: %w", role, err)
 			}
 
