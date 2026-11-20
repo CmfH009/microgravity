@@ -18,6 +18,7 @@ import (
 	"github.com/CmfH009/microgravity/internal/engine"
 	"github.com/CmfH009/microgravity/internal/models"
 	"github.com/CmfH009/microgravity/internal/ollama"
+	"github.com/CmfH009/microgravity/internal/router"
 	"github.com/CmfH009/microgravity/internal/rules"
 	"github.com/CmfH009/microgravity/internal/scheduler"
 	"github.com/CmfH009/microgravity/internal/sessions"
@@ -66,11 +67,96 @@ func completer(d prompt.Document) []prompt.Suggest {
 		{Text: "/ci", Description: "Generate production CI/CD GitHub Actions workflows"},
 		{Text: "/mcp", Description: "Inspect and manage MCP servers (/mcp list|add|remove)"},
 		{Text: "/rules", Description: "Inspect active project and global rules"},
+		{Text: "/local", Description: "Toggle or set routing mode (/local [on|off|hybrid|local-only|cloud-only|status])"},
+		{Text: "/theme", Description: "Switch UI theme (/theme [dark|light|auto|tokyo-night|catppuccin|high-contrast])"},
 		{Text: "/teamwork-preview", Description: "Multi-agent swarm collaboration preview"},
 		{Text: "/teamwork", Description: "Multi-agent swarm collaboration preview"},
 	}
 
 	return prompt.FilterHasPrefix(s, word, true)
+}
+
+func isSupportedTheme(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "dark", "light", "auto", "tokyo-night", "catppuccin", "high-contrast":
+		return true
+	default:
+		return false
+	}
+}
+
+func handleLocalSlashCommand(sess *engine.Session, raw string) string {
+	arg := strings.ToLower(strings.TrimSpace(raw))
+	switch arg {
+	case "", "status":
+		mode := config.GetRoutingMode()
+		fast := modelName
+		heavy := ""
+		base := ""
+		if sess != nil {
+			mode = string(sess.GetRoutingMode())
+			if sess.Config.LocalFastModel != "" {
+				fast = sess.Config.LocalFastModel
+			} else if sess.Config.LocalModelName != "" {
+				fast = sess.Config.LocalModelName
+			}
+			heavy = sess.Config.LocalHeavyModel
+			base = sess.Config.OpenAIBaseURL
+		}
+		if heavy == "" {
+			heavy = fast
+		}
+		msg := fmt.Sprintf("Routing mode: %s (fast=%s, heavy=%s)", mode, fast, heavy)
+		if base != "" {
+			msg += fmt.Sprintf(" [openai base-url=%s]", base)
+		}
+		return ui.PrintSystemInfo(msg)
+
+	case "on", "local", "local-only", "offline":
+		if sess != nil {
+			sess.SetRoutingMode(string(router.ModeLocalOnly))
+		}
+		if err := config.SetRoutingMode(string(router.ModeLocalOnly)); err != nil {
+			return ui.PrintError(err)
+		}
+		return ui.PrintSystemInfo("Routing mode switched to local-only (cloud calls disabled).")
+
+	case "off", "hybrid", "auto":
+		if sess != nil {
+			sess.SetRoutingMode(string(router.ModeHybrid))
+		}
+		if err := config.SetRoutingMode(string(router.ModeHybrid)); err != nil {
+			return ui.PrintError(err)
+		}
+		return ui.PrintSystemInfo("Routing mode switched to hybrid.")
+
+	case "cloud", "cloud-only":
+		if sess != nil {
+			sess.SetRoutingMode(string(router.ModeCloudOnly))
+		}
+		if err := config.SetRoutingMode(string(router.ModeCloudOnly)); err != nil {
+			return ui.PrintError(err)
+		}
+		return ui.PrintSystemInfo("Routing mode switched to cloud-only.")
+
+	default:
+		return ui.PrintSystemInfo("Usage: /local [on|off|hybrid|local-only|cloud-only|status]")
+	}
+}
+
+func handleThemeSlashCommand(raw string) string {
+	arg := strings.ToLower(strings.TrimSpace(raw))
+	if arg == "" || arg == "status" {
+		return ui.PrintSystemInfo(fmt.Sprintf("Active theme: %s (available: dark, light, auto, tokyo-night, catppuccin, high-contrast)", ui.CurrentTheme.Name))
+	}
+	if !isSupportedTheme(arg) {
+		return ui.PrintError(fmt.Errorf("unknown theme %q (supported: dark, light, auto, tokyo-night, catppuccin, high-contrast)", arg))
+	}
+	ui.SetTheme(arg)
+	if err := config.SetTheme(arg); err != nil {
+		return ui.PrintError(err)
+	}
+	return ui.PrintSystemInfo(fmt.Sprintf("Theme switched to %s.", arg))
 }
 
 var chatCmd = &cobra.Command{
@@ -96,21 +182,55 @@ var chatCmd = &cobra.Command{
 			}
 		}()
 
+		cfgDisk, _ := config.LoadConfig()
 		activeModelID := config.GetActiveModel()
+		if rootModel != "" {
+			activeModelID = rootModel
+		}
 		if activeModelID != "" {
 			cloudModel = activeModelID
 		}
 
+		routingMode := resolveRoutingMode(cfgDisk, rootLocal, rootRoutingMode)
+		openAIBaseURL := resolveOpenAIBaseURL(cfgDisk, rootBaseURL)
+		openAIAPIKey := resolveOpenAIAPIKey(cfgDisk)
+		localFast, localHeavy := resolveLocalTierModels(cfgDisk, rootLocalFastModel, rootLocalHeavyModel, modelName)
+		if localFast != "" && modelName == "gemma:2b" {
+			modelName = localFast
+		}
+		openAIModel := ""
+		if cfgDisk != nil {
+			openAIModel = strings.TrimSpace(cfgDisk.OpenAIModel)
+		}
+
 		opts := SessionOptions{
-			SessionName:    sessionName,
-			ActiveModel:    cloudModel,
-			LocalModelName: modelName,
-			CloudModelName: cloudModel,
-			OllamaBaseURL:  baseURL,
-			MCPServers:     mcpServers,
-			NotifyChan:     notifyChan,
-			AddDirs:        rootAddDirs,
-			Sandbox:        rootSandbox,
+			SessionName:     sessionName,
+			ActiveModel:     cloudModel,
+			LocalModelName:  modelName,
+			CloudModelName:  cloudModel,
+			OllamaBaseURL:   baseURL,
+			RoutingMode:     routingMode,
+			LocalFastModel:  localFast,
+			LocalHeavyModel: localHeavy,
+			OpenAIBaseURL:   openAIBaseURL,
+			OpenAIAPIKey:    openAIAPIKey,
+			OpenAIModel:     openAIModel,
+			MCPServers:      mcpServers,
+			NotifyChan:      notifyChan,
+			AddDirs:         rootAddDirs,
+			Sandbox:         rootSandbox,
+			DryRun:          rootDryRun,
+		}
+		if openAIBaseURL != "" {
+			opts.ExplicitProvider = "openai"
+			if rootModel != "" {
+				opts.OpenAIModel = rootModel
+			}
+		} else if rootModel != "" && !isCloudModelID(rootModel) {
+			opts.LocalModelName = rootModel
+			if opts.LocalFastModel == "" {
+				opts.LocalFastModel = rootModel
+			}
 		}
 
 		sess, cleanup, err := BuildEngineSession(ctx, opts)
@@ -122,23 +242,38 @@ var chatCmd = &cobra.Command{
 
 		_ = sess.LoadSavedHistory()
 
-		ollama.EnsureOllama()
 		ollamaClient := ollama.NewClient(baseURL)
-		hasModel, _ := ollamaClient.HasModel(ctx, modelName)
-		daemon := updater.NewDaemon(ollamaClient, modelName)
-		daemon.Start()
-		defer daemon.Stop()
-
 		localModelStatus := ""
-		if hasModel {
-			localModelStatus = modelName
+		if opts.OpenAIBaseURL != "" {
+			if modelsList, lErr := sess.OpenAIClient.ListModels(ctx); lErr == nil && len(modelsList) > 0 {
+				localModelStatus = modelsList[0]
+			} else if opts.OpenAIModel != "" {
+				localModelStatus = opts.OpenAIModel
+			} else {
+				localModelStatus = opts.OpenAIBaseURL
+			}
+		} else {
+			ollama.EnsureOllama()
+			hasModel, _ := ollamaClient.HasModel(ctx, modelName)
+			daemon := updater.NewDaemon(ollamaClient, modelName)
+			daemon.Start()
+			defer daemon.Stop()
+			if hasModel {
+				localModelStatus = modelName
+			}
 		}
 
 		cwd, _ := os.Getwd()
 		mcpConnected := len(sess.Config.MCPClients)
 		loadedSkills := sess.Config.LoadedSkills
 
-		ui.PrintStatusSummary(cloudModel, mcpConnected, len(loadedSkills), localModelStatus)
+		displayModel := cloudModel
+		if opts.OpenAIBaseURL != "" && opts.OpenAIModel != "" {
+			displayModel = opts.OpenAIModel
+		} else if opts.RoutingMode == string(router.ModeLocalOnly) && opts.LocalFastModel != "" {
+			displayModel = opts.LocalFastModel
+		}
+		ui.PrintStatusSummary(displayModel, mcpConnected, len(loadedSkills), localModelStatus)
 
 		if initialPrompt != "" {
 			firstPrompt := initialPrompt
@@ -163,7 +298,7 @@ var chatCmd = &cobra.Command{
 				continue
 			}
 			if input == "/help" {
-				fmt.Println("Available commands:\n  /exit       - Leave chat\n  /clear      - Clear history\n  /subagents  - Inspect/spawn/kill subagents (/subagents list|spawn|kill-all)\n  /schedule   - Set timers or cron jobs (/schedule timer 10s 'msg')\n  /audit      - Run project health & directive audit\n  /paste      - Multi-line paste buffer mode\n  /model      - Interactive model selector / switch model\n  /skills     - List loaded skills\n  /plan       - Request structured execution plan\n  /goal       - Execute autonomous goal loop\n  /learn      - Persist custom directive to rules.md\n  /grill-me   - Interactive requirements interview\n  /help       - Show this message")
+				fmt.Println("Available commands:\n  /exit       - Leave chat\n  /clear      - Clear history\n  /local      - Toggle local-only routing (/local [on|off|hybrid|local-only|cloud-only|status])\n  /theme      - Switch UI theme (/theme [dark|light|auto|tokyo-night|catppuccin|high-contrast])\n  /subagents  - Inspect/spawn/kill subagents (/subagents list|spawn|kill-all)\n  /schedule   - Set timers or cron jobs (/schedule timer 10s 'msg')\n  /audit      - Run project health & directive audit\n  /paste      - Multi-line paste buffer mode\n  /model      - Interactive model selector / switch model\n  /skills     - List loaded skills\n  /plan       - Request structured execution plan\n  /goal       - Execute autonomous goal loop\n  /learn      - Persist custom directive to rules.md\n  /grill-me   - Interactive requirements interview\n  /help       - Show this message")
 				continue
 			}
 			if input == "/audit" {
@@ -475,6 +610,12 @@ var chatCmd = &cobra.Command{
 					}
 				}
 				fmt.Println(ui.PrintSeparator())
+				continue
+			} else if input == "/local" || strings.HasPrefix(input, "/local ") {
+				fmt.Println(handleLocalSlashCommand(sess, strings.TrimPrefix(input, "/local")))
+				continue
+			} else if input == "/theme" || strings.HasPrefix(input, "/theme ") {
+				fmt.Println(handleThemeSlashCommand(strings.TrimPrefix(input, "/theme")))
 				continue
 			} else if strings.HasPrefix(input, "/dashboard") {
 				fmt.Println(ui.PrintSystemInfo("Launching Telemetry Control Center (mg dashboard)... Run in separate terminal or use 'mg dashboard -w'."))

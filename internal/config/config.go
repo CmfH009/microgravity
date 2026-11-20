@@ -31,6 +31,13 @@ type Config struct {
 	MCPServers         []string         `json:"mcp_servers,omitempty"`
 	MCPServersDetailed []MCPServerEntry `json:"mcp_servers_detailed,omitempty"`
 	ActiveModel        string           `json:"active_model,omitempty"`
+	RoutingMode        string           `json:"routing_mode,omitempty"`
+	LocalFastModel     string           `json:"local_fast_model,omitempty"`
+	LocalHeavyModel    string           `json:"local_heavy_model,omitempty"`
+	OpenAIBaseURL      string           `json:"openai_base_url,omitempty"`
+	OpenAIAPIKey       string           `json:"openai_api_key,omitempty"`
+	OpenAIModel        string           `json:"openai_model,omitempty"`
+	Theme              string           `json:"theme,omitempty"`
 }
 
 func GetConfigPath() (string, error) {
@@ -203,6 +210,71 @@ func SetActiveModel(modelID string) error {
 	return SaveConfig(cfg)
 }
 
+func normalizeRoutingMode(mode string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "local-only", "local", "offline":
+		return "local-only", true
+	case "hybrid", "auto", "":
+		return "hybrid", true
+	case "cloud-only", "cloud":
+		return "cloud-only", true
+	default:
+		return "", false
+	}
+}
+
+// GetRoutingMode returns the persisted routing mode ("local-only", "hybrid", or "cloud-only"),
+// defaulting to "hybrid" when unset.
+func GetRoutingMode() string {
+	cfg, err := LoadConfig()
+	if err == nil {
+		if norm, ok := normalizeRoutingMode(cfg.RoutingMode); ok && cfg.RoutingMode != "" {
+			return norm
+		}
+	}
+	return "hybrid"
+}
+
+// SetRoutingMode validates and persists the active routing mode ("local-only", "hybrid", or "cloud-only").
+func SetRoutingMode(mode string) error {
+	if strings.TrimSpace(mode) == "" {
+		return fmt.Errorf("routing mode cannot be empty (expected local-only, hybrid, or cloud-only)")
+	}
+	norm, ok := normalizeRoutingMode(mode)
+	if !ok {
+		return fmt.Errorf("invalid routing mode %q: expected local-only, hybrid, or cloud-only", mode)
+	}
+	cfg, err := LoadConfig()
+	if err != nil {
+		cfg = &Config{}
+	}
+	cfg.RoutingMode = norm
+	return SaveConfig(cfg)
+}
+
+// GetTheme returns the persisted UI theme name, defaulting to "dark" when unset.
+func GetTheme() string {
+	cfg, err := LoadConfig()
+	if err == nil && strings.TrimSpace(cfg.Theme) != "" {
+		return strings.ToLower(strings.TrimSpace(cfg.Theme))
+	}
+	return "dark"
+}
+
+// SetTheme persists the active UI theme name.
+func SetTheme(theme string) error {
+	clean := strings.ToLower(strings.TrimSpace(theme))
+	if clean == "" {
+		return fmt.Errorf("theme name cannot be empty")
+	}
+	cfg, err := LoadConfig()
+	if err != nil {
+		cfg = &Config{}
+	}
+	cfg.Theme = clean
+	return SaveConfig(cfg)
+}
+
 func GetSkillsDir() string {
 	path, err := GetConfigPath()
 	if err != nil {
@@ -247,14 +319,31 @@ func GetMCPServers() []string {
 
 // DetectOrbitMCPServer returns the execution command for Orbit's stdlib MCP server if present on disk.
 func DetectOrbitMCPServer() string {
-	agyHome := os.Getenv("AGY_HOME")
-	candidates := []string{
-		filepath.Join(agyHome, "system", "scripts", "orbit_mcp_server.py"),
-		`A:\system\scripts\orbit_mcp_server.py`,
-		`C:\AgyHut\system\scripts\orbit_mcp_server.py`,
+	var candidates []string
+	if script := strings.TrimSpace(os.Getenv("MG_ORBIT_MCP_SCRIPT")); script != "" {
+		candidates = append(candidates, script)
 	}
+	if mgHome := strings.TrimSpace(os.Getenv("MG_HOME")); mgHome != "" {
+		candidates = append(candidates,
+			filepath.Join(mgHome, "scripts", "orbit_mcp_server.py"),
+			filepath.Join(mgHome, "system", "scripts", "orbit_mcp_server.py"),
+		)
+	}
+	if agyHome := strings.TrimSpace(os.Getenv("AGY_HOME")); agyHome != "" {
+		candidates = append(candidates,
+			filepath.Join(agyHome, "system", "scripts", "orbit_mcp_server.py"),
+			filepath.Join(agyHome, "scripts", "orbit_mcp_server.py"),
+		)
+	}
+	if home, err := os.UserHomeDir(); err == nil && strings.TrimSpace(home) != "" {
+		candidates = append(candidates,
+			filepath.Join(home, ".microgravity", "scripts", "orbit_mcp_server.py"),
+			filepath.Join(home, ".gemini", "antigravity-cli", "scripts", "orbit_mcp_server.py"),
+		)
+	}
+
 	for _, p := range candidates {
-		if p == "" || p == filepath.Join("system", "scripts", "orbit_mcp_server.py") {
+		if p == "" {
 			continue
 		}
 		if fi, err := os.Stat(p); err == nil && !fi.IsDir() {

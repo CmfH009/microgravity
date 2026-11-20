@@ -17,6 +17,7 @@ import (
 	"github.com/CmfH009/microgravity/internal/mcp"
 	"github.com/CmfH009/microgravity/internal/memory"
 	"github.com/CmfH009/microgravity/internal/policy"
+	"github.com/CmfH009/microgravity/internal/router"
 	"github.com/CmfH009/microgravity/internal/rules"
 	"github.com/CmfH009/microgravity/internal/sandbox"
 	"github.com/CmfH009/microgravity/internal/scheduler"
@@ -39,6 +40,12 @@ type SessionOptions struct {
 	DisableSlash     bool
 	CavemanLevel     string
 	ExplicitProvider string
+	RoutingMode      string
+	LocalFastModel   string
+	LocalHeavyModel  string
+	OpenAIBaseURL    string
+	OpenAIAPIKey     string
+	OpenAIModel      string
 	MCPServers       []string
 	NotifyChan       chan string
 	AddDirs          []string
@@ -54,6 +61,50 @@ func BuildEngineSession(ctx context.Context, opts SessionOptions) (*engine.Sessi
 	cwd := opts.Cwd
 	if cwd == "" {
 		cwd, _ = os.Getwd()
+	}
+
+	cfgDisk, _ := config.LoadConfig()
+	if strings.TrimSpace(opts.RoutingMode) == "" {
+		if envMode, ok := router.RoutingModeFromEnv(); ok {
+			opts.RoutingMode = string(envMode)
+		} else if cfgDisk != nil && strings.TrimSpace(cfgDisk.RoutingMode) != "" {
+			opts.RoutingMode = string(router.NormalizeRoutingMode(cfgDisk.RoutingMode))
+		} else {
+			opts.RoutingMode = string(router.ModeHybrid)
+		}
+	} else {
+		opts.RoutingMode = string(router.NormalizeRoutingMode(opts.RoutingMode))
+	}
+	if strings.TrimSpace(opts.LocalFastModel) == "" {
+		if envFast := strings.TrimSpace(os.Getenv("MG_LOCAL_FAST_MODEL")); envFast != "" {
+			opts.LocalFastModel = envFast
+		} else if cfgDisk != nil && strings.TrimSpace(cfgDisk.LocalFastModel) != "" {
+			opts.LocalFastModel = strings.TrimSpace(cfgDisk.LocalFastModel)
+		}
+	}
+	if strings.TrimSpace(opts.LocalHeavyModel) == "" {
+		if envHeavy := strings.TrimSpace(os.Getenv("MG_LOCAL_HEAVY_MODEL")); envHeavy != "" {
+			opts.LocalHeavyModel = envHeavy
+		} else if cfgDisk != nil && strings.TrimSpace(cfgDisk.LocalHeavyModel) != "" {
+			opts.LocalHeavyModel = strings.TrimSpace(cfgDisk.LocalHeavyModel)
+		}
+	}
+	if strings.TrimSpace(opts.OpenAIBaseURL) == "" {
+		if envURL := strings.TrimSpace(os.Getenv("MG_OPENAI_BASE_URL")); envURL != "" {
+			opts.OpenAIBaseURL = envURL
+		} else if cfgDisk != nil && strings.TrimSpace(cfgDisk.OpenAIBaseURL) != "" {
+			opts.OpenAIBaseURL = strings.TrimSpace(cfgDisk.OpenAIBaseURL)
+		}
+	}
+	if strings.TrimSpace(opts.OpenAIAPIKey) == "" {
+		if envKey := strings.TrimSpace(os.Getenv("MG_OPENAI_API_KEY")); envKey != "" {
+			opts.OpenAIAPIKey = envKey
+		} else if cfgDisk != nil && strings.TrimSpace(cfgDisk.OpenAIAPIKey) != "" {
+			opts.OpenAIAPIKey = strings.TrimSpace(cfgDisk.OpenAIAPIKey)
+		}
+	}
+	if strings.TrimSpace(opts.OpenAIModel) == "" && cfgDisk != nil && strings.TrimSpace(cfgDisk.OpenAIModel) != "" {
+		opts.OpenAIModel = strings.TrimSpace(cfgDisk.OpenAIModel)
 	}
 
 	mcpClients := make([]*mcp.Client, 0)
@@ -139,6 +190,12 @@ func BuildEngineSession(ctx context.Context, opts SessionOptions) (*engine.Sessi
 			AutoApprove:      true,
 			DisableSlash:     true,
 			ExplicitProvider: opts.ExplicitProvider,
+			RoutingMode:      opts.RoutingMode,
+			LocalFastModel:   opts.LocalFastModel,
+			LocalHeavyModel:  opts.LocalHeavyModel,
+			OpenAIBaseURL:    opts.OpenAIBaseURL,
+			OpenAIAPIKey:     opts.OpenAIAPIKey,
+			OpenAIModel:      opts.OpenAIModel,
 			AddDirs:          []string{workDir},
 			Sandbox:          opts.Sandbox,
 			Cwd:              workDir,
@@ -223,6 +280,12 @@ func BuildEngineSession(ctx context.Context, opts SessionOptions) (*engine.Sessi
 		LoadedRules:      loadedRules,
 		Executor:         exec,
 		ExplicitProvider: opts.ExplicitProvider,
+		RoutingMode:      opts.RoutingMode,
+		LocalFastModel:   opts.LocalFastModel,
+		LocalHeavyModel:  opts.LocalHeavyModel,
+		OpenAIBaseURL:    opts.OpenAIBaseURL,
+		OpenAIAPIKey:     opts.OpenAIAPIKey,
+		OpenAIModel:      opts.OpenAIModel,
 		MemoryStore:      memStore,
 	}
 
