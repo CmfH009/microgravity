@@ -3,6 +3,7 @@ package models
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -15,6 +16,7 @@ type model struct {
 	cursor   int
 	selected ModelInfo
 	activeID string
+	err      error
 }
 
 func (m model) Init() tea.Cmd {
@@ -28,21 +30,29 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "ctrl+c", "q", "esc":
 			return m, tea.Quit
 		case "up", "k":
+			if len(m.catalog) == 0 {
+				return m, nil
+			}
 			if m.cursor > 0 {
 				m.cursor--
 			} else {
 				m.cursor = len(m.catalog) - 1
 			}
 		case "down", "j":
+			if len(m.catalog) == 0 {
+				return m, nil
+			}
 			if m.cursor < len(m.catalog)-1 {
 				m.cursor++
 			} else {
 				m.cursor = 0
 			}
 		case "enter":
-			if len(m.catalog) > 0 {
+			if len(m.catalog) > 0 && m.cursor >= 0 && m.cursor < len(m.catalog) {
 				m.selected = m.catalog[m.cursor]
-				config.SetActiveModel(m.selected.ID)
+				if err := config.SetActiveModel(m.selected.ID); err != nil {
+					m.err = err
+				}
 			}
 			return m, tea.Quit
 		}
@@ -100,6 +110,12 @@ func (m model) View() string {
 }
 
 func RunTUI(ctx context.Context) (ModelInfo, bool) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return ModelInfo{}, false
+	}
 	scanner := NewScanner()
 	catalog, err := scanner.Scan(ctx)
 	if err != nil || len(catalog) == 0 {
@@ -122,7 +138,7 @@ func RunTUI(ctx context.Context) (ModelInfo, bool) {
 		catalog:  catalog,
 		cursor:   initialCursor,
 		activeID: activeID,
-	})
+	}, tea.WithContext(ctx))
 
 	m, err := p.Run()
 	if err != nil {
@@ -130,6 +146,10 @@ func RunTUI(ctx context.Context) (ModelInfo, bool) {
 	}
 
 	if finalModel, ok := m.(model); ok && finalModel.selected.ID != "" {
+		if finalModel.err != nil {
+			fmt.Fprintf(os.Stderr, "failed to save active model %s: %v\n", finalModel.selected.ID, finalModel.err)
+			return ModelInfo{}, false
+		}
 		return finalModel.selected, true
 	}
 	return ModelInfo{}, false

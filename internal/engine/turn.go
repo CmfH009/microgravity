@@ -5,26 +5,41 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/briandowns/spinner"
+	"github.com/CmfH009/microgravity/internal/cloud"
 	"github.com/CmfH009/microgravity/internal/cmdparse"
 	ctxPkg "github.com/CmfH009/microgravity/internal/context"
+	"github.com/CmfH009/microgravity/internal/executor"
+	"github.com/CmfH009/microgravity/internal/mcp"
+	"github.com/CmfH009/microgravity/internal/ollama"
 	"github.com/CmfH009/microgravity/internal/plan"
 	"github.com/CmfH009/microgravity/internal/pruner"
 	"github.com/CmfH009/microgravity/internal/router"
 	"github.com/CmfH009/microgravity/internal/trajectory"
+	"github.com/CmfH009/microgravity/internal/verifier"
 	"github.com/CmfH009/microgravity/internal/vision"
 )
 
+const defaultMaxTurns = 64
+
 type streamingWriter struct {
+	mu             sync.Mutex
 	spinnerStarted bool
 	spinner        *spinner.Spinner
 	buf            strings.Builder
 	passthrough    io.Writer
+	closed         bool
 }
 
 func (w *streamingWriter) Write(p []byte) (n int, err error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return len(p), nil
+	}
 	if w.spinner != nil && w.spinnerStarted {
 		w.spinner.Stop()
 		w.spinnerStarted = false
@@ -33,11 +48,147 @@ func (w *streamingWriter) Write(p []byte) (n int, err error) {
 		}
 	}
 	if w.passthrough != nil {
-		_, _ = w.passthrough.Write(p)
+		if _, wErr := w.passthrough.Write(p); wErr != nil {
+			return 0, wErr
+		}
 	} else {
 		fmt.Print(string(p))
 	}
 	return w.buf.Write(p)
+}
+
+func (w *streamingWriter) StopSpinner() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.spinner != nil && w.spinnerStarted {
+		w.spinner.Stop()
+		w.spinnerStarted = false
+	}
+}
+
+func (w *streamingWriter) Disable() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.closed = true
+	if w.spinner != nil && w.spinnerStarted {
+		w.spinner.Stop()
+		w.spinnerStarted = false
+	}
+}
+
+type genOutcome struct {
+	text  string
+	calls []cmdparse.ToolCall
+}
+
+type turnDispatchParams struct {
+	explicitProvider string
+	activeModel      string
+	localModelName   string
+	cloudModelName   string
+	complexity       router.Complexity
+	fullPrompt       string
+	turnImages       []string
+	availableTools   []mcp.Tool
+	ollamaClient     *ollama.Client
+	cloudClient      *cloud.Client
+	sw               *streamingWriter
+}
+
+func generateWithFailover(ctx context.Context, p turnDispatchParams) (genOutcome, error) {
+	callOllama := func() (genOutcome, error) {
+		if p.ollamaClient == nil {
+			return genOutcome{}, fmt.Errorf("ollama client not initialized")
+		}
+		res, err := p.ollamaClient.GenerateWithTools(ctx, p.localModelName, p.fullPrompt, p.turnImages, p.availableTools, p.sw)
+		if err != nil {
+			return genOutcome{}, err
+		}
+		if res == nil {
+			return genOutcome{}, fmt.Errorf("ollama returned nil result")
+		}
+		return genOutcome{text: strings.TrimSpace(res.Text), calls: res.ToolCalls}, nil
+	}
+
+	callCloud := func(modelName string) (genOutcome, error) {
+		if p.cloudClient == nil {
+			return genOutcome{}, fmt.Errorf("cloud client not initialized")
+		}
+		res, err := p.cloudClient.GenerateWithTools(ctx, modelName, p.fullPrompt, p.turnImages, p.availableTools, p.sw)
+		if err != nil {
+			return genOutcome{}, err
+		}
+		if res == nil {
+			return genOutcome{}, fmt.Errorf("cloud returned nil result")
+		}
+		return genOutcome{text: strings.TrimSpace(res.Text), calls: res.ToolCalls}, nil
+	}
+
+	switch p.explicitProvider {
+	case "ollama":
+		out, err := callOllama()
+		if err == nil {
+			return out, nil
+		}
+		if ctx.Err() != nil {
+			return genOutcome{}, ctx.Err()
+		}
+		p.sw.StopSpinner()
+		outCloud, errCloud := callCloud(p.cloudModelName)
+		if errCloud == nil {
+			return outCloud, nil
+		}
+		return genOutcome{}, fmt.Errorf("ollama failed (%w); cloud fallback failed (%w)", err, errCloud)
+
+	case "cloud":
+		out, err := callCloud(p.activeModel)
+		if err == nil {
+			return out, nil
+		}
+		if ctx.Err() != nil {
+			return genOutcome{}, ctx.Err()
+		}
+		p.sw.StopSpinner()
+		outLocal, errLocal := callOllama()
+		if errLocal == nil {
+			return outLocal, nil
+		}
+		return genOutcome{}, fmt.Errorf("cloud failed (%w); ollama fallback failed (%w)", err, errLocal)
+	}
+
+	// Automatic Routing
+	var ollamaErr error
+	ollamaTried := false
+	if p.complexity == router.ComplexitySimple {
+		out, err := callOllama()
+		if err == nil {
+			return out, nil
+		}
+		if ctx.Err() != nil {
+			return genOutcome{}, ctx.Err()
+		}
+		ollamaErr = err
+		ollamaTried = true
+	}
+
+	outCloud, errCloud := callCloud(p.activeModel)
+	if errCloud == nil {
+		return outCloud, nil
+	}
+	if ctx.Err() != nil {
+		return genOutcome{}, ctx.Err()
+	}
+
+	if ollamaTried {
+		return genOutcome{}, fmt.Errorf("ollama failed (%w); cloud failed (%w)", ollamaErr, errCloud)
+	}
+
+	p.sw.StopSpinner()
+	outLocal, errLocal := callOllama()
+	if errLocal == nil {
+		return outLocal, nil
+	}
+	return genOutcome{}, fmt.Errorf("cloud failed (%w); ollama fallback failed (%w)", errCloud, errLocal)
 }
 
 // RunPrompt executes a single turn or non-interactive prompt through the full engine pipeline.
@@ -47,6 +198,16 @@ func (s *Session) RunPrompt(ctx context.Context, prompt string, images []string,
 
 // ExecuteTurn processes a user turn, handles tool calling loops, and returns the final agent response.
 func (s *Session) ExecuteTurn(ctx context.Context, userInput string, turnImages []string, writer io.Writer) (string, error) {
+	if s == nil {
+		return "", fmt.Errorf("session is nil")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+
 	s.SetState(StateThinking)
 	defer s.SetState(StateIdle)
 
@@ -62,13 +223,42 @@ func (s *Session) ExecuteTurn(ctx context.Context, userInput string, turnImages 
 	// Process @file and @dir context references
 	cleanInput, injectedContext, _ := ctxPkg.ProcessFileReferences(cleanInput)
 
+	s.mu.RLock()
+	activeModel := s.Config.ActiveModel
+	localModelName := s.Config.LocalModelName
+	cloudModelName := s.Config.CloudModelName
+	explicitProvider := s.Config.ExplicitProvider
+	cwd := s.Config.Cwd
+	maxTurns := s.Config.MaxTurns
+	exec := s.Config.Executor
+	ollamaClient := s.OllamaClient
+	cloudClient := s.CloudClient
+	routerInst := s.Router
+	verifierInst := s.Verifier
+	trajLogger := s.TrajLogger
+	asyncCh := s.AsyncEvents
+	s.mu.RUnlock()
+
+	if maxTurns <= 0 {
+		maxTurns = defaultMaxTurns
+	}
+	if localModelName == "" {
+		localModelName = "gemma:2b"
+	}
+	if cloudModelName == "" {
+		cloudModelName = "gemini-3.6-flash"
+	}
+	if activeModel == "" {
+		activeModel = cloudModelName
+	}
+
 	s.mu.Lock()
 	s.Conversation.WriteString("\nUser: " + cleanInput + injectedContext + "\nAgent: ")
 	s.Messages = append(s.Messages, NewUserMessage(cleanInput+injectedContext, turnImages...))
 	s.mu.Unlock()
 
-	if s.TrajLogger != nil {
-		_ = s.TrajLogger.LogStep("USER_EXPLICIT", "USER_INPUT", "DONE", cleanInput+injectedContext, "", nil)
+	if trajLogger != nil {
+		_ = trajLogger.LogStep("USER_EXPLICIT", "USER_INPUT", "DONE", cleanInput+injectedContext, "", nil)
 	}
 
 	autoToolExecuted := false
@@ -79,12 +269,19 @@ func (s *Session) ExecuteTurn(ctx context.Context, userInput string, turnImages 
 
 	// Inner Agentic Loop: loops while tools are being executed
 	for {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
 		turnCounter++
+		if turnCounter > maxTurns {
+			return "", fmt.Errorf("turn loop exceeded max turns (%d)", maxTurns)
+		}
+
 		s.mu.RLock()
 		convoStr := s.Conversation.String()
 		s.mu.RUnlock()
 
-		maxModelTokens := pruner.MaxTokensForModel(s.Config.ActiveModel)
+		maxModelTokens := pruner.MaxTokensForModel(activeModel)
 		sysPrompt := s.BuildSystemPrompt()
 		sysTokens := pruner.EstimateTokens(sysPrompt)
 		outputReserve := 4096
@@ -98,7 +295,10 @@ func (s *Session) ExecuteTurn(ctx context.Context, userInput string, turnImages 
 
 		prunedConvo, _ := pruner.PruneContext(convoStr, maxConvoTokens)
 		fullPrompt := sysPrompt + "\n---CONVERSATION---\n" + prunedConvo
-		complexity := s.Router.Classify(cleanInput)
+		complexity := router.ComplexityComplex
+		if routerInst != nil {
+			complexity = routerInst.Classify(cleanInput)
+		}
 
 		var spin *spinner.Spinner
 		if writer == nil {
@@ -116,123 +316,97 @@ func (s *Session) ExecuteTurn(ctx context.Context, userInput string, turnImages 
 
 		availableTools := s.GetAvailableTools()
 
-		type genOutcome struct {
-			text  string
-			calls []cmdparse.ToolCall
-		}
-
 		ctxCancel, cancel := context.WithCancel(ctx)
 		llmCh := make(chan genOutcome, 1)
 		errCh := make(chan error, 1)
+		doneCh := make(chan struct{})
 
 		go func() {
+			defer close(doneCh)
 			defer cancel()
-			activeModel := s.Config.ActiveModel
-			provider := s.Config.ExplicitProvider
-
-			// Check explicit provider preference
-			if provider == "ollama" {
-				res, err := s.OllamaClient.GenerateWithTools(ctxCancel, s.Config.LocalModelName, fullPrompt, turnImages, availableTools, sw)
-				if err == nil {
-					llmCh <- genOutcome{text: strings.TrimSpace(res.Text), calls: res.ToolCalls}
-					return
-				}
-				resCloud, errCloud := s.CloudClient.GenerateWithTools(ctxCancel, s.Config.CloudModelName, fullPrompt, turnImages, availableTools, sw)
-				if errCloud == nil {
-					llmCh <- genOutcome{text: strings.TrimSpace(resCloud.Text), calls: resCloud.ToolCalls}
-					return
-				}
-				errCh <- err
-				return
-			} else if provider == "cloud" {
-				res, err := s.CloudClient.GenerateWithTools(ctxCancel, activeModel, fullPrompt, turnImages, availableTools, sw)
-				if err == nil {
-					llmCh <- genOutcome{text: strings.TrimSpace(res.Text), calls: res.ToolCalls}
-					return
-				}
-				if sw.spinner != nil {
-					sw.spinner.Stop()
-				}
-				resLocal, errLocal := s.OllamaClient.GenerateWithTools(ctxCancel, s.Config.LocalModelName, fullPrompt, turnImages, availableTools, sw)
-				if errLocal == nil {
-					llmCh <- genOutcome{text: strings.TrimSpace(resLocal.Text), calls: resLocal.ToolCalls}
-					return
-				}
-				errCh <- err
+			out, genErr := generateWithFailover(ctxCancel, turnDispatchParams{
+				explicitProvider: explicitProvider,
+				activeModel:      activeModel,
+				localModelName:   localModelName,
+				cloudModelName:   cloudModelName,
+				complexity:       complexity,
+				fullPrompt:       fullPrompt,
+				turnImages:       turnImages,
+				availableTools:   availableTools,
+				ollamaClient:     ollamaClient,
+				cloudClient:      cloudClient,
+				sw:               sw,
+			})
+			if genErr != nil {
+				errCh <- genErr
 				return
 			}
-
-			// Automatic Routing
-			if complexity == router.ComplexitySimple {
-				res, err := s.OllamaClient.GenerateWithTools(ctxCancel, s.Config.LocalModelName, fullPrompt, turnImages, availableTools, sw)
-				if err == nil {
-					llmCh <- genOutcome{text: strings.TrimSpace(res.Text), calls: res.ToolCalls}
-					return
-				}
-			}
-
-			resCloud, errCloud := s.CloudClient.GenerateWithTools(ctxCancel, activeModel, fullPrompt, turnImages, availableTools, sw)
-			if errCloud == nil {
-				llmCh <- genOutcome{text: strings.TrimSpace(resCloud.Text), calls: resCloud.ToolCalls}
-				return
-			}
-
-			if sw.spinner != nil {
-				sw.spinner.Stop()
-			}
-			resLocal, errLocal := s.OllamaClient.GenerateWithTools(ctxCancel, s.Config.LocalModelName, fullPrompt, turnImages, availableTools, sw)
-			if errLocal == nil {
-				llmCh <- genOutcome{text: strings.TrimSpace(resLocal.Text), calls: resLocal.ToolCalls}
-				return
-			}
-			errCh <- errCloud
+			llmCh <- out
 		}()
 
 		var responseText string
 		var nativeToolCalls []cmdparse.ToolCall
 		var genErr error
+		preemptedByAsync := false
 
-		select {
-		case err := <-errCh:
-			if spin != nil {
-				spin.Stop()
+	waitSelect:
+		for {
+			select {
+			case err := <-errCh:
+				<-doneCh
+				sw.StopSpinner()
+				genErr = err
+				break waitSelect
+			case ev, ok := <-asyncCh:
+				if !ok {
+					asyncCh = nil
+					continue
+				}
+				sw.Disable()
+				cancel()
+				<-doneCh
+				if err := ctx.Err(); err != nil {
+					return "", err
+				}
+				label := "Async Event"
+				switch ev.Topic {
+				case "task_completed":
+					label = "Background Task Completed"
+				case "scheduler_alerts":
+					label = "Scheduler Alert"
+				case "subagent_responses":
+					label = "Subagent Response"
+				}
+				s.mu.Lock()
+				s.Conversation.WriteString(fmt.Sprintf("\n[%s]: %s\nAgent: ", label, ev.Payload))
+				s.Messages = append(s.Messages, NewSystemMessage(label, ev.Payload))
+				s.mu.Unlock()
+				_ = s.SaveHistory()
+				preemptedByAsync = true
+				break waitSelect
+			case outcome := <-llmCh:
+				<-doneCh
+				sw.StopSpinner()
+				responseText = outcome.text
+				nativeToolCalls = outcome.calls
+				if writer == nil {
+					fmt.Println()
+				}
+				break waitSelect
+			case <-ctx.Done():
+				sw.Disable()
+				cancel()
+				<-doneCh
+				return "", ctx.Err()
 			}
-			genErr = err
-		case ev := <-s.AsyncEvents:
-			if spin != nil {
-				spin.Stop()
-			}
-			label := "Async Event"
-			switch ev.Topic {
-			case "task_completed":
-				label = "Background Task Completed"
-			case "scheduler_alerts":
-				label = "Scheduler Alert"
-			case "subagent_responses":
-				label = "Subagent Response"
-			}
-			s.mu.Lock()
-			s.Conversation.WriteString(fmt.Sprintf("\n[%s]: %s\nAgent: ", label, ev.Payload))
-			s.Messages = append(s.Messages, NewSystemMessage(label, ev.Payload))
-			s.mu.Unlock()
-			_ = s.SaveHistory()
-			continue // re-trigger model with async event update
-		case outcome := <-llmCh:
-			responseText = outcome.text
-			nativeToolCalls = outcome.calls
-			if spin != nil && sw.spinnerStarted {
-				spin.Stop()
-			}
-			if writer == nil {
-				fmt.Println()
-			}
-		case <-ctx.Done():
-			if spin != nil {
-				spin.Stop()
-			}
-			return "", ctx.Err()
 		}
 
+		if preemptedByAsync {
+			continue
+		}
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
 		if genErr != nil {
 			return "", genErr
 		}
@@ -248,11 +422,19 @@ func (s *Session) ExecuteTurn(ctx context.Context, userInput string, turnImages 
 		finalResponse = responseText
 
 		// Parse and track interactive execution plans
+		var activePlan *plan.Plan
 		if parsedPlan, err := plan.ParsePlan(responseText); err == nil && len(parsedPlan.Tasks) > 0 {
+			s.mu.Lock()
 			s.ActivePlan = parsedPlan
+			activePlan = parsedPlan
+			s.mu.Unlock()
 			if writer == nil {
-				fmt.Println(s.ActivePlan.RenderTUI())
+				fmt.Println(activePlan.RenderTUI())
 			}
+		} else {
+			s.mu.RLock()
+			activePlan = s.ActivePlan
+			s.mu.RUnlock()
 		}
 
 		s.mu.Lock()
@@ -290,11 +472,14 @@ func (s *Session) ExecuteTurn(ctx context.Context, userInput string, turnImages 
 			}
 		}
 
-		if s.TrajLogger != nil {
-			_ = s.TrajLogger.LogStep("MODEL", "PLANNER_RESPONSE", "DONE", responseText, "", loggedTools)
+		if trajLogger != nil {
+			_ = trajLogger.LogStep("MODEL", "PLANNER_RESPONSE", "DONE", responseText, "", loggedTools)
 		}
 
 		if hasToolCalls && parseErr == nil && len(reqs) > 0 {
+			if exec == nil {
+				return "", fmt.Errorf("tool executor is not initialized")
+			}
 			toolExecuted = true
 			s.SetState(StateExecutingTools)
 
@@ -314,7 +499,10 @@ func (s *Session) ExecuteTurn(ctx context.Context, userInput string, turnImages 
 				_, _ = s.CreateCheckpoint(turnCounter, fmt.Sprintf("Turn %d pre-edit", turnCounter))
 			}
 
-			toolOutput, _ := s.Config.Executor.ExecuteToolCalls(ctx, reqs, s.Config.Cwd, s.ActivePlan)
+			toolOutput, _ := exec.ExecuteToolCalls(ctx, reqs, cwd, activePlan)
+			if err := ctx.Err(); err != nil {
+				return "", err
+			}
 
 			s.mu.Lock()
 			s.Conversation.WriteString(fmt.Sprintf("\nTool Output:\n%s\n", toolOutput))
@@ -323,14 +511,23 @@ func (s *Session) ExecuteTurn(ctx context.Context, userInput string, turnImages 
 			_ = s.SaveHistory()
 
 			// 3. In-Turn Doubt-Driven Verification & Self-Correction
-			if isModifyingFiles && s.Verifier != nil {
+			if isModifyingFiles && verifierInst != nil {
 				s.SetState(StateVerifying)
-				verResult, _ := s.Verifier.Verify(ctx, s.Config.Cwd)
+				verResult, verErr := verifierInst.Verify(ctx, cwd)
+				if err := ctx.Err(); err != nil {
+					return "", err
+				}
+				if verErr != nil && verResult == nil {
+					verResult = &verifier.VerificationResult{
+						Passed: false,
+						Output: verErr.Error(),
+					}
+				}
 				if verResult != nil && !verResult.Passed {
 					if healingAttempts < maxHealingAttempts {
 						healingAttempts++
-						if s.TrajLogger != nil {
-							_ = s.TrajLogger.LogStep("SYSTEM", "VERIFICATION_FAILURE", "ERROR", verResult.Output, "", nil)
+						if trajLogger != nil {
+							_ = trajLogger.LogStep("SYSTEM", "VERIFICATION_FAILURE", "ERROR", verResult.Output, "", nil)
 						}
 						diagStr := verResult.Output
 						if len(verResult.Diagnoses) > 0 {
@@ -359,7 +556,7 @@ func (s *Session) ExecuteTurn(ctx context.Context, userInput string, turnImages 
 		}
 
 		// Fallback for hallucinated tool calls
-		if !toolExecuted && !autoToolExecuted {
+		if !toolExecuted && !autoToolExecuted && exec != nil {
 			lowerInput := strings.ToLower(cleanInput)
 			lowerResp := strings.ToLower(responseText)
 
@@ -379,7 +576,10 @@ func (s *Session) ExecuteTurn(ctx context.Context, userInput string, turnImages 
 					autoArgs = map[string]interface{}{"query": cleanInput}
 				}
 
-				toolOutput, ok := s.Config.Executor.HandleToolCall(ctx, autoTool, autoArgs, s.Config.Cwd, s.ActivePlan)
+				toolOutput, ok := exec.HandleToolCall(ctx, autoTool, autoArgs, cwd, activePlan)
+				if err := ctx.Err(); err != nil {
+					return "", err
+				}
 				if ok && toolOutput != "" {
 					s.mu.Lock()
 					cur := s.Conversation.String()
@@ -404,3 +604,5 @@ func (s *Session) ExecuteTurn(ctx context.Context, userInput string, turnImages 
 
 	return finalResponse, nil
 }
+
+var _ = (*executor.Executor)(nil)
