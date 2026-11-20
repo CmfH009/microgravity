@@ -22,10 +22,12 @@ var (
 	jsAssertErrRegex  = regexp.MustCompile(`(AssertionError:[^\n]+|Expected:[^\n]+|Received:[^\n]+)`)
 
 	// Pytest patterns
-	pytestFailRegex        = regexp.MustCompile(`FAILED\s+([a-zA-Z0-9_\-\/\.\\]+\.py)::([A-Za-z0-9_]+)(?:\s*-\s*(.*))?`)
-	pytestFileLineRegex     = regexp.MustCompile(`File\s+"([a-zA-Z0-9_\-\/\.\\]+\.py)",\s+line\s+(\d+),\s+in\s+([A-Za-z0-9_]+)`)
-	pytestShortFileRegex    = regexp.MustCompile(`([a-zA-Z0-9_\-\/\.\\]+\.py):(\d+):`)
-	pytestErrLineRegex      = regexp.MustCompile(`E\s+(.+)`)
+	pytestFailRegex        = regexp.MustCompile(`FAILED\s+([a-zA-Z0-9_\-\/\.\\]+\.py)::(\S+?)(?:\s+-\s+(.*))?$`)
+	pytestFileLineRegex    = regexp.MustCompile(`File\s+"([a-zA-Z0-9_\-\/\.\\]+\.py)",\s+line\s+(\d+),\s+in\s+([A-Za-z0-9_<>]+)`)
+	pytestShortFileRegex   = regexp.MustCompile(`^\s*([a-zA-Z0-9_\-\/\.\\]+\.py):(\d+):`)
+	pytestErrLineRegex     = regexp.MustCompile(`^E\s+(.+)`)
+	pytestSectionBannerRe  = regexp.MustCompile(`^={3,}\s*(.*?)\s*={3,}$`)
+	pytestTestHeaderBanner = regexp.MustCompile(`^_{3,}\s+(.+?)\s+_{3,}$`)
 
 	// Cargo patterns
 	cargoTestFailRegex = regexp.MustCompile(`test\s+([a-zA-Z0-9_:]+)\s+\.\.\.\s+FAILED`)
@@ -160,50 +162,156 @@ func parseJSErrors(output string, fw FrameworkType) []FailureDiagnosis {
 	return deduplicateDiagnoses(diags)
 }
 
+func isPytestWarningNoise(line string) bool {
+	lower := strings.ToLower(line)
+	return strings.Contains(lower, "site-packages") ||
+		strings.Contains(lower, "dist-packages") ||
+		strings.Contains(line, "Warning:")
+}
+
 func parsePytestErrors(output string) []FailureDiagnosis {
 	var diags []FailureDiagnosis
+	var summaryCandidates []FailureDiagnosis
 	lines := strings.Split(output, "\n")
 
 	var currentFile string
 	var currentLine int
 	var currentTest string
-	var currentMsg string
+	var errBuf []string
+	var errSnippets []string
+	var lastShortMsg string
+	var blockHadDiag bool
+	var inWarningsSummary bool
 
-	for _, line := range lines {
+	flushBlock := func() {
+		if currentFile == "" {
+			errBuf = nil
+			errSnippets = nil
+			lastShortMsg = ""
+			return
+		}
+		if len(errBuf) > 0 {
+			msg := strings.Join(errBuf, "\n")
+			snippet := strings.Join(errSnippets, "\n")
+			diags = append(diags, FailureDiagnosis{
+				Framework:     FrameworkPytest,
+				TestName:      currentTest,
+				FilePath:      currentFile,
+				LineNumber:    currentLine,
+				Message:       msg,
+				OutputSnippet: snippet,
+				SuggestedFix:  suggestFix(msg, FrameworkPytest),
+			})
+			blockHadDiag = true
+		} else if !blockHadDiag && lastShortMsg != "" {
+			diags = append(diags, FailureDiagnosis{
+				Framework:     FrameworkPytest,
+				TestName:      currentTest,
+				FilePath:      currentFile,
+				LineNumber:    currentLine,
+				Message:       lastShortMsg,
+				OutputSnippet: fmt.Sprintf("%s:%d: %s", currentFile, currentLine, lastShortMsg),
+				SuggestedFix:  suggestFix(lastShortMsg, FrameworkPytest),
+			})
+			blockHadDiag = true
+		}
+		errBuf = nil
+		errSnippets = nil
+		lastShortMsg = ""
+	}
+
+	for _, rawLine := range lines {
+		line := strings.TrimRight(rawLine, "\r")
 		lineTrim := strings.TrimSpace(line)
+		if lineTrim == "" {
+			continue
+		}
 
-		if matches := pytestFailRegex.FindStringSubmatch(line); len(matches) > 2 {
-			currentFile = matches[1]
-			currentTest = matches[2]
-			if len(matches) > 3 && matches[3] != "" {
-				currentMsg = matches[3]
+		if matches := pytestSectionBannerRe.FindStringSubmatch(lineTrim); len(matches) > 1 {
+			flushBlock()
+			currentFile = ""
+			currentLine = 0
+			currentTest = ""
+			blockHadDiag = false
+			titleLower := strings.ToLower(matches[1])
+			inWarningsSummary = strings.Contains(titleLower, "warnings summary")
+			continue
+		}
+
+		if inWarningsSummary || isPytestWarningNoise(line) {
+			continue
+		}
+
+		if matches := pytestTestHeaderBanner.FindStringSubmatch(lineTrim); len(matches) > 1 && strings.Trim(matches[1], "_ ") != "" {
+			flushBlock()
+			currentFile = ""
+			currentLine = 0
+			currentTest = strings.TrimSpace(matches[1])
+			blockHadDiag = false
+			continue
+		}
+
+		if matches := pytestFailRegex.FindStringSubmatch(lineTrim); len(matches) > 2 {
+			msg := strings.TrimSpace(matches[3])
+			if msg == "" {
+				msg = "Pytest assertion/execution failed"
 			}
+			summaryCandidates = append(summaryCandidates, FailureDiagnosis{
+				Framework:     FrameworkPytest,
+				TestName:      matches[2],
+				FilePath:      matches[1],
+				Message:       msg,
+				OutputSnippet: lineTrim,
+				SuggestedFix:  suggestFix(msg, FrameworkPytest),
+			})
+			continue
 		}
 
 		if matches := pytestFileLineRegex.FindStringSubmatch(line); len(matches) > 3 {
 			currentFile = matches[1]
 			currentLine, _ = strconv.Atoi(matches[2])
 			currentTest = matches[3]
+			lastShortMsg = ""
+			continue
 		}
 
 		if matches := pytestShortFileRegex.FindStringSubmatch(line); len(matches) > 2 {
+			if len(errBuf) == 0 && !blockHadDiag && lastShortMsg != "" && currentFile != "" {
+				flushBlock()
+			}
 			currentFile = matches[1]
 			currentLine, _ = strconv.Atoi(matches[2])
+			rest := strings.TrimSpace(line[len(matches[0]):])
+			if len(errBuf) > 0 {
+				flushBlock()
+			} else if rest != "" && !strings.HasPrefix(rest, "in ") {
+				lastShortMsg = rest
+			}
+			continue
 		}
 
 		if matches := pytestErrLineRegex.FindStringSubmatch(line); len(matches) > 1 {
-			currentMsg = matches[1]
-			if currentFile != "" {
-				diags = append(diags, FailureDiagnosis{
-					Framework:     FrameworkPytest,
-					TestName:      currentTest,
-					FilePath:      currentFile,
-					LineNumber:    currentLine,
-					Message:       currentMsg,
-					OutputSnippet: lineTrim,
-					SuggestedFix:  suggestFix(currentMsg, FrameworkPytest),
-				})
+			errText := strings.TrimSpace(matches[1])
+			if errText != "" {
+				errBuf = append(errBuf, errText)
+				errSnippets = append(errSnippets, lineTrim)
 			}
+		}
+	}
+
+	flushBlock()
+
+	diagnosedFiles := make(map[string]bool, len(diags))
+	for _, d := range diags {
+		if d.FilePath != "" {
+			diagnosedFiles[d.FilePath] = true
+		}
+	}
+
+	for _, cand := range summaryCandidates {
+		if !diagnosedFiles[cand.FilePath] {
+			diags = append(diags, cand)
+			diagnosedFiles[cand.FilePath] = true
 		}
 	}
 

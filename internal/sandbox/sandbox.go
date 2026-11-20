@@ -10,12 +10,34 @@ import (
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/pkg/stdcopy"
+	specs "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
-func runInContainer(ctx context.Context, imageName string, cmd []string) (string, error) {
+type dockerClient interface {
+	ImagePull(ctx context.Context, refStr string, options types.ImagePullOptions) (io.ReadCloser, error)
+	ContainerCreate(ctx context.Context, config *container.Config, hostConfig *container.HostConfig, networkingConfig *network.NetworkingConfig, platform *specs.Platform, containerName string) (container.ContainerCreateCreatedBody, error)
+	ContainerStart(ctx context.Context, containerID string, options types.ContainerStartOptions) error
+	ContainerWait(ctx context.Context, containerID string, condition container.WaitCondition) (<-chan container.ContainerWaitOKBody, <-chan error)
+	ContainerLogs(ctx context.Context, container string, options types.ContainerLogsOptions) (io.ReadCloser, error)
+	ContainerRemove(ctx context.Context, containerID string, options types.ContainerRemoveOptions) error
+	Close() error
+}
+
+var _ dockerClient = (*client.Client)(nil)
+
+var newDockerClient = func() (dockerClient, error) {
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		return nil, err
+	}
+	return cli, nil
+}
+
+func runInContainer(ctx context.Context, imageName string, cmd []string) (string, error) {
+	cli, err := newDockerClient()
 	if err != nil {
 		return "", fmt.Errorf("failed to create docker client: %w", err)
 	}
@@ -23,8 +45,10 @@ func runInContainer(ctx context.Context, imageName string, cmd []string) (string
 
 	reader, err := cli.ImagePull(ctx, imageName, types.ImagePullOptions{})
 	if err == nil {
-		_, _ = io.Copy(io.Discard, reader)
-		reader.Close()
+		if reader != nil {
+			_, _ = io.Copy(io.Discard, reader)
+			reader.Close()
+		}
 	} else if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 		return "", fmt.Errorf("image pull cancelled/timed out: %w", err)
 	}

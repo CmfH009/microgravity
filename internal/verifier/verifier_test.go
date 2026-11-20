@@ -270,3 +270,131 @@ func TestAutoFixFeedbackLoopPytest(t *testing.T) {
 		t.Errorf("Expected Pytest AutoFix loop to pass, output: %s", res.Output)
 	}
 }
+
+func TestDiagnoseOutputPytest_TbAutoWithWarnings(t *testing.T) {
+	pyOutput := `C:\Python314\Lib\site-packages\pytest_asyncio\plugin.py:300: PytestDeprecationWarning: The configuration option "asyncio_default_fixture_loop_scope" is unset.
+  warnings.warn(PytestDeprecationWarning(_DEFAULT_FIXTURE_LOOP_SCOPE_UNSET))
+============================= test session starts =============================
+platform win32 -- Python 3.14.6, pytest-9.2.0, pluggy-1.6.0
+cachedir: .pytest_cache
+rootdir: C:\Temp\proj
+configfile: pytest.ini
+plugins: anyio-4.14.2, jaxtyping-0.3.11, asyncio-1.4.1, cov-7.1.0
+collected 1 item
+
+test_calc.py F                                                           [100%]
+
+================================== FAILURES ===================================
+__________________________________ test_add ___________________________________
+
+    def test_add():
+        got = 2 + 2
+        want = 5
+>       assert got == want
+E       assert 4 == 5
+
+test_calc.py:4: AssertionError
+============================== warnings summary ===============================
+..\..\..\..\..\..\Python314\Lib\site-packages\anyio\pytest_plugin.py:14
+  C:\Python314\Lib\site-packages\anyio\pytest_plugin.py:14: PytestRemovedIn10Warning: _pytest.python.CallSpec2 has been renamed to CallSpec.
+    from _pytest.python import CallSpec2
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ===========================
+FAILED test_calc.py::test_add - assert 4 == 5
+======================== 1 failed, 1 warning in 0.17s =========================`
+
+	diags := DiagnoseOutput(pyOutput, FrameworkPytest)
+	if len(diags) != 1 {
+		t.Fatalf("Expected exactly 1 diagnosis, got %d: %+v", len(diags), diags)
+	}
+	if diags[0].FilePath != "test_calc.py" {
+		t.Errorf("Expected FilePath 'test_calc.py', got %q", diags[0].FilePath)
+	}
+	if diags[0].LineNumber != 4 {
+		t.Errorf("Expected LineNumber 4, got %d", diags[0].LineNumber)
+	}
+	if diags[0].TestName != "test_add" {
+		t.Errorf("Expected TestName 'test_add', got %q", diags[0].TestName)
+	}
+	if !strings.Contains(diags[0].Message, "assert 4 == 5") {
+		t.Errorf("Expected Message to contain 'assert 4 == 5', got %q", diags[0].Message)
+	}
+}
+
+func TestDiagnoseOutputPytest_MultipleFailuresAndSummaryFallback(t *testing.T) {
+	pyOutput := strings.ReplaceAll(`================================== FAILURES ===================================
+__________________________________ test_one ___________________________________
+
+    def test_one():
+>       assert 1 == 2
+E       assert 1 == 2
+
+tests/test_one.py:2: AssertionError
+__________________________________ test_two ___________________________________
+
+    def test_two():
+>       assert 'a' == 'b'
+E       AssertionError: assert 'a' == 'b'
+E         - b
+E         + a
+
+tests/test_two.py:7: AssertionError
+=========================== short test summary info ===========================
+FAILED tests/test_one.py::test_one - assert 1 == 2
+FAILED tests/test_two.py::test_two - AssertionError: assert 'a' == 'b'
+FAILED tests/test_three.py::test_three - ValueError: missing key
+`, "\n", "\r\n")
+
+	diags := DiagnoseOutput(pyOutput, FrameworkPytest)
+	if len(diags) != 3 {
+		t.Fatalf("Expected 3 diagnoses, got %d: %+v", len(diags), diags)
+	}
+
+	if diags[0].FilePath != "tests/test_one.py" || diags[0].LineNumber != 2 || diags[0].TestName != "test_one" || !strings.Contains(diags[0].Message, "assert 1 == 2") {
+		t.Errorf("Unexpected first diagnosis: %+v", diags[0])
+	}
+	if diags[1].FilePath != "tests/test_two.py" || diags[1].LineNumber != 7 || diags[1].TestName != "test_two" || !strings.Contains(diags[1].Message, "assert 'a' == 'b'") {
+		t.Errorf("Unexpected second diagnosis: %+v", diags[1])
+	}
+	if diags[2].FilePath != "tests/test_three.py" || diags[2].TestName != "test_three" || diags[2].Message != "ValueError: missing key" {
+		t.Errorf("Unexpected third (summary fallback) diagnosis: %+v", diags[2])
+	}
+}
+
+func TestDiagnoseOutputPytest_SummaryOnly(t *testing.T) {
+	pyOutput := `=========================== short test summary info ===========================
+FAILED tests/test_api.py::test_status - AssertionError: 500 != 200`
+
+	diags := DiagnoseOutput(pyOutput, FrameworkPytest)
+	if len(diags) != 1 {
+		t.Fatalf("Expected 1 diagnosis, got %d: %+v", len(diags), diags)
+	}
+	if diags[0].FilePath != "tests/test_api.py" {
+		t.Errorf("Expected FilePath 'tests/test_api.py', got %q", diags[0].FilePath)
+	}
+	if diags[0].TestName != "test_status" {
+		t.Errorf("Expected TestName 'test_status', got %q", diags[0].TestName)
+	}
+	if diags[0].Message != "AssertionError: 500 != 200" {
+		t.Errorf("Expected Message 'AssertionError: 500 != 200', got %q", diags[0].Message)
+	}
+}
+
+func TestDiagnoseOutputPytest_TbShort(t *testing.T) {
+	pyOutput := `================================== FAILURES ===================================
+__________________________________ test_mul ___________________________________
+test_short.py:9: in test_mul
+    assert 2 * 3 == 7
+E   assert 6 == 7
+=========================== short test summary info ===========================
+FAILED test_short.py::test_mul - assert 6 == 7`
+
+	diags := DiagnoseOutput(pyOutput, FrameworkPytest)
+	if len(diags) != 1 {
+		t.Fatalf("Expected 1 diagnosis, got %d: %+v", len(diags), diags)
+	}
+	if diags[0].FilePath != "test_short.py" || diags[0].LineNumber != 9 || diags[0].TestName != "test_mul" || !strings.Contains(diags[0].Message, "assert 6 == 7") {
+		t.Errorf("Unexpected diagnosis for --tb=short: %+v", diags[0])
+	}
+}
