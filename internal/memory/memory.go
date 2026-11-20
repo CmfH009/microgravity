@@ -127,9 +127,45 @@ func (m *MemoryStore) StoreTurn(sessionID, userMsg, assistantMsg string) error {
 // RetrieveRelevant searches past conversations for content semantically
 // similar to the query, returning the most relevant results.
 func (m *MemoryStore) RetrieveRelevant(query string, topK int) ([]rag.SearchResult, error) {
+	if strings.TrimSpace(query) == "" {
+		return nil, nil
+	}
 	ctx := context.Background()
 	queryEmbedding := m.Embedding(query)
-	return m.ragStore.Search(ctx, queryEmbedding, topK)
+	raw, err := m.ragStore.Search(ctx, queryEmbedding, topK)
+	if err != nil {
+		return nil, err
+	}
+	return FilterRelevant(raw, 0.0001), nil
+}
+
+// ShouldInjectMemory returns true when a prompt is substantive enough to
+// benefit from cross-session memory context injection.
+func ShouldInjectMemory(query string) bool {
+	trimmed := strings.TrimSpace(query)
+	if len(trimmed) < 12 {
+		return false
+	}
+	return len(strings.Fields(trimmed)) >= 3
+}
+
+// FilterRelevant keeps only search results meeting minScore and strips any
+// recursively stored memory-injection prompts.
+func FilterRelevant(results []rag.SearchResult, minScore float32) []rag.SearchResult {
+	if len(results) == 0 {
+		return nil
+	}
+	filtered := make([]rag.SearchResult, 0, len(results))
+	for _, r := range results {
+		if r.Score < minScore {
+			continue
+		}
+		if strings.Contains(r.Text, "[Relevant context from past sessions]") {
+			continue
+		}
+		filtered = append(filtered, r)
+	}
+	return filtered
 }
 
 // hashString returns a deterministic hash of a string for ID generation.

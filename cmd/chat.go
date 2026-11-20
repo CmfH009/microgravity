@@ -15,6 +15,7 @@ import (
 	"github.com/CmfH009/microgravity/internal/git"
 	"github.com/CmfH009/microgravity/internal/history"
 	"github.com/CmfH009/microgravity/internal/lock"
+	"github.com/CmfH009/microgravity/internal/memory"
 	"github.com/CmfH009/microgravity/internal/engine"
 	"github.com/CmfH009/microgravity/internal/models"
 	"github.com/CmfH009/microgravity/internal/ollama"
@@ -679,9 +680,13 @@ var chatCmd = &cobra.Command{
 			allImages = append(allImages, turnImages...)
 			images := allImages
 
+			rawUserInput := cleanInput
+			turnInput := rawUserInput
+
 			// Retrieve relevant context from cross-session memory
-			if sess.Config.MemoryStore != nil {
-				ctxResults, memErr := sess.Config.MemoryStore.RetrieveRelevant(cleanInput, 3)
+			if sess.Config.MemoryStore != nil && memory.ShouldInjectMemory(rawUserInput) {
+				ctxResults, memErr := sess.Config.MemoryStore.RetrieveRelevant(rawUserInput, 3)
+				ctxResults = memory.FilterRelevant(ctxResults, 0.45)
 				if memErr == nil && len(ctxResults) > 0 {
 					var ctx strings.Builder
 					ctx.WriteString("[Relevant context from past sessions]\n")
@@ -689,11 +694,11 @@ var chatCmd = &cobra.Command{
 						ctx.WriteString(fmt.Sprintf("  - %s\n", r.Text))
 					}
 					ctx.WriteString("\n")
-					cleanInput = ctx.String() + cleanInput
+					turnInput = ctx.String() + rawUserInput
 				}
 			}
 
-			responseText, err = sess.ExecuteTurn(ctx, cleanInput, images, nil)
+			responseText, err = sess.ExecuteTurn(ctx, turnInput, images, nil)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "%s\n", ui.PrintError(err))
 			}
@@ -712,7 +717,7 @@ var chatCmd = &cobra.Command{
 				if lastResp == "" {
 					lastResp = responseText // fallback from ExecuteTurn return
 				}
-				_ = sess.Config.MemoryStore.StoreTurn(sessionName, cleanInput, lastResp)
+				_ = sess.Config.MemoryStore.StoreTurn(sessionName, rawUserInput, lastResp)
 			}
 		}
 	},

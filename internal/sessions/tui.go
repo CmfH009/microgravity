@@ -92,7 +92,7 @@ func RunTUI() string {
 		return ""
 	}
 
-	p := tea.NewProgram(model{sessions: list, cursor: 0})
+	p := tea.NewProgram(model{sessions: list, cursor: 0}, tea.WithAltScreen())
 	m, err := p.Run()
 	if err != nil {
 		return ""

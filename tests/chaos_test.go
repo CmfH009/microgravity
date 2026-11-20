@@ -1,8 +1,10 @@
-package main_test
+package tests
 
 import (
 	"bytes"
 	"os/exec"
+	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -12,15 +14,17 @@ import (
 // It exposes the CLI to 50 rapid-fire invalid flag requests to test
 // fault tolerance, process cleanup, and leak prevention.
 func TestChaos_RapidFire(t *testing.T) {
-	// Build the executable once for the test
-	buildCmd := exec.Command("go", "build", "-o", "mg-chaos-test.exe", "main.go")
-	if err := buildCmd.Run(); err != nil {
-		t.Fatalf("Failed to build executable for chaos testing: %v", err)
+	binName := "mg-chaos-test"
+	if runtime.GOOS == "windows" {
+		binName += ".exe"
 	}
-	defer func() {
-		// Cleanup the executable after the test
-		_ = exec.Command("cmd", "/c", "del", "mg-chaos-test.exe").Run()
-	}()
+	binPath := filepath.Join(t.TempDir(), binName)
+
+	// Build the executable once into TempDir so the repo stays clean.
+	buildCmd := exec.Command("go", "build", "-o", binPath, "..")
+	if out, err := buildCmd.CombinedOutput(); err != nil {
+		t.Fatalf("Failed to build executable for chaos testing: %v\n%s", err, string(out))
+	}
 
 	const iterations = 50
 	var wg sync.WaitGroup
@@ -31,9 +35,9 @@ func TestChaos_RapidFire(t *testing.T) {
 		wg.Add(1)
 		go func(iteration int) {
 			defer wg.Done()
-			
+
 			// Execute the command with an unknown flag
-			cmd := exec.Command("./mg-chaos-test.exe", "--run-unknown-xyz")
+			cmd := exec.Command(binPath, "--run-unknown-xyz")
 			var stderr bytes.Buffer
 			cmd.Stderr = &stderr
 			

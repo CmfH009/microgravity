@@ -20,6 +20,7 @@ import (
 	"github.com/CmfH009/microgravity/internal/engine"
 	"github.com/CmfH009/microgravity/internal/history"
 	"github.com/CmfH009/microgravity/internal/lock"
+	"github.com/CmfH009/microgravity/internal/memory"
 	"github.com/CmfH009/microgravity/internal/ollama"
 	"github.com/CmfH009/microgravity/internal/pruner"
 	"github.com/CmfH009/microgravity/internal/subagent"
@@ -870,10 +871,12 @@ func (m *model) executeTurn(input string) {
 		return
 	}
 
-	promptInput := input
+	rawInput := input
+	promptInput := rawInput
 	memStore := m.sess.Config.MemoryStore
-	if memStore != nil {
-		ctxResults, memErr := memStore.RetrieveRelevant(input, 3)
+	if memStore != nil && memory.ShouldInjectMemory(rawInput) {
+		ctxResults, memErr := memStore.RetrieveRelevant(rawInput, 3)
+		ctxResults = memory.FilterRelevant(ctxResults, 0.45)
 		if memErr == nil && len(ctxResults) > 0 {
 			var ctxBuf strings.Builder
 			ctxBuf.WriteString("[Relevant context from past sessions]\n")
@@ -881,7 +884,7 @@ func (m *model) executeTurn(input string) {
 				ctxBuf.WriteString(fmt.Sprintf("  - %s\n", r.Text))
 			}
 			ctxBuf.WriteString("\n")
-			promptInput = ctxBuf.String() + input
+			promptInput = ctxBuf.String() + rawInput
 		}
 	}
 
@@ -900,7 +903,7 @@ func (m *model) executeTurn(input string) {
 				}
 			}
 		}
-		_ = memStore.StoreTurn(m.sess.Config.SessionName, promptInput, lastResp)
+		_ = memStore.StoreTurn(m.sess.Config.SessionName, rawInput, lastResp)
 	}
 
 	sendTUIMsg(turnResultMsg{response: resp, err: err})

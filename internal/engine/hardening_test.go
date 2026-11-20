@@ -819,3 +819,58 @@ func TestTurn_LocalActiveModel_HybridNeverCallsCloud(t *testing.T) {
 		t.Fatalf("expected ollama model orbit-thinker:latest, got %q", gotModel)
 	}
 }
+
+func TestTurn_NoSpuriousAutoToolWithoutPlaceholder(t *testing.T) {
+	isolateEngineTestEnv(t)
+
+	var toolCalls int32
+	reg := tools.NewRegistry()
+	reg.Register(mcp.Tool{Name: "search_web", InputSchema: mcp.Schema{Type: "object"}}, func(ctx context.Context, args map[string]interface{}) (string, error) {
+		atomic.AddInt32(&toolCalls, 1)
+		return "search results", nil
+	})
+	reg.Register(mcp.Tool{Name: "get_current_time", InputSchema: mcp.Schema{Type: "object"}}, func(ctx context.Context, args map[string]interface{}) (string, error) {
+		atomic.AddInt32(&toolCalls, 1)
+		return "2026-11-19", nil
+	})
+
+	var ollamaHits int32
+	ollamaSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hit := atomic.AddInt32(&ollamaHits, 1)
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		if hit == 1 {
+			_, _ = w.Write([]byte(`{"message":{"role":"assistant","content":"Hello! How can I help you today?"},"done":true}` + "\n"))
+			return
+		}
+		_, _ = w.Write([]byte(`{"message":{"role":"assistant","content":"Done."},"done":true}` + "\n"))
+	}))
+	defer ollamaSrv.Close()
+
+	sess, err := engine.NewSession(engine.SessionConfig{
+		SessionName:   "no-spurious-autotool",
+		ActiveModel:   "gemma4:e2b",
+		RoutingMode:   "local-only",
+		OllamaBaseURL: ollamaSrv.URL,
+		Registry:      reg,
+		CoreMemory:    "<core_memory></core_memory>",
+	})
+	if err != nil {
+		t.Fatalf("NewSession failed: %v", err)
+	}
+	defer sess.Close()
+
+	// Even if prompt contains "search" or "today", normal non-placeholder output must NOT auto-run tools.
+	resp, err := sess.ExecuteTurn(context.Background(), "search today hello", nil, ioDiscard{})
+	if err != nil {
+		t.Fatalf("ExecuteTurn failed: %v", err)
+	}
+	if resp != "Hello! How can I help you today?" {
+		t.Fatalf("unexpected response: %q", resp)
+	}
+	if atomic.LoadInt32(&toolCalls) != 0 {
+		t.Fatalf("expected 0 spurious auto-tool executions, got %d", toolCalls)
+	}
+	if atomic.LoadInt32(&ollamaHits) != 1 {
+		t.Fatalf("expected single LLM pass without re-execution, got %d", ollamaHits)
+	}
+}

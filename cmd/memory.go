@@ -26,19 +26,21 @@ Usage:
 		home, _ := os.UserHomeDir()
 		dbPath := filepath.Join(home, ".microgravity", "memory.db")
 
+		if memoryClear {
+			if err := os.Remove(dbPath); err != nil && !os.IsNotExist(err) {
+				fmt.Fprintf(os.Stderr, "%s\n", ui.PrintError(fmt.Errorf("failed to clear memory store: %w", err)))
+				os.Exit(1)
+			}
+			ui.PrintStepSuccess("Memory store cleared.")
+			return
+		}
+
 		store, err := memory.NewMemoryStore(dbPath)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "%s\n", ui.PrintError(fmt.Errorf("failed to open memory store: %w", err)))
 			os.Exit(1)
 		}
 		defer store.Close()
-
-		if memoryClear {
-			// Clear is not directly supported by the store; recreate the DB
-			_ = os.Remove(dbPath)
-			ui.PrintStepSuccess("Memory store cleared.")
-			return
-		}
 
 		if len(args) < 1 {
 			fmt.Println(ui.PrintSystemInfo("Usage: mg memory <query>"))
@@ -62,8 +64,7 @@ Usage:
 		fmt.Println(ui.PrintHeader(" 🧠 Cross-Session Memory Search "))
 		fmt.Printf("Query: %s\n\n", query)
 		for i, r := range results {
-			fmt.Printf("  %d. %.0f%%  %s\n", i+1, r.Score*100, r.ID)
-			fmt.Printf("     %s\n", memory.FormatResult(r))
+			fmt.Printf("  %d.%s\n", i+1, memory.FormatResult(r))
 		}
 	},
 }

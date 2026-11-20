@@ -685,10 +685,9 @@ func (s *Session) ExecuteTurn(ctx context.Context, userInput string, turnImages 
 			lowerResp := strings.ToLower(responseText)
 
 			hasPlaceholder := strings.Contains(lowerResp, "[link") || strings.Contains(lowerResp, "web search access") || strings.Contains(lowerResp, "[current time")
-			wantsTime := strings.Contains(lowerInput, "date") || strings.Contains(lowerInput, "time") || strings.Contains(lowerInput, "today")
-			wantsSearch := strings.Contains(lowerInput, "search") || strings.Contains(lowerInput, "look up")
+			wantsTime := strings.Contains(lowerInput, "date") || strings.Contains(lowerInput, "time") || strings.Contains(lowerInput, "today") || strings.Contains(lowerResp, "[current time")
 
-			if hasPlaceholder || wantsTime || wantsSearch {
+			if hasPlaceholder {
 				autoToolExecuted = true
 				var autoTool string
 				var autoArgs map[string]interface{}

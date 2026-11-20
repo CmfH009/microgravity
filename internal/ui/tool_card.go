@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/charmbracelet/lipgloss"
 )
@@ -14,16 +15,12 @@ var (
 	ToolCardBoxSuccess = lipgloss.NewStyle().
 				Border(lipgloss.RoundedBorder()).
 				BorderForeground(RoleColor(RoleSuccess)).
-				Padding(0, 1).
-				MarginTop(0).
-				MarginBottom(1)
+				Padding(0, 1)
 
 	ToolCardBoxFailed = lipgloss.NewStyle().
 				Border(lipgloss.RoundedBorder()).
 				BorderForeground(RoleColor(RoleError)).
-				Padding(0, 1).
-				MarginTop(0).
-				MarginBottom(1)
+				Padding(0, 1)
 
 	ToolHeaderStyle = lipgloss.NewStyle().
 			Foreground(RoleColor(RoleHighlight)).
@@ -70,15 +67,11 @@ func currentToolCardPalette() toolCardPalette {
 		boxSuccess: lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(successColor).
-			Padding(0, 1).
-			MarginTop(0).
-			MarginBottom(1),
+			Padding(0, 1),
 		boxFailed: lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(errorColor).
-			Padding(0, 1).
-			MarginTop(0).
-			MarginBottom(1),
+			Padding(0, 1),
 		header: lipgloss.NewStyle().
 			Foreground(RoleColor(RoleHighlight)).
 			Bold(true),
@@ -138,6 +131,28 @@ func RenderToolCallCard(toolName string, args map[string]interface{}, duration t
 	return RenderCollapsibleToolCard(toolName, args, duration, success, output, true)
 }
 
+func formatToolDuration(d time.Duration) string {
+	switch {
+	case d >= time.Second:
+		return d.Round(10 * time.Millisecond).String()
+	case d >= time.Millisecond:
+		return d.Round(time.Millisecond).String()
+	default:
+		return d.String()
+	}
+}
+
+func truncateToolLine(s string, maxRunes int) string {
+	s = strings.ReplaceAll(s, "\r\n", " ")
+	s = strings.ReplaceAll(s, "\n", " ")
+	s = strings.ReplaceAll(s, "\r", " ")
+	if maxRunes <= 3 || utf8.RuneCountInString(s) <= maxRunes {
+		return s
+	}
+	runes := []rune(s)
+	return string(runes[:maxRunes-3]) + "..."
+}
+
 // RenderCollapsibleToolCard renders a tool call card either as a compact 1-line bordered
 // summary (expanded == false) or with full parameters and output preview (expanded == true).
 // All styles are resolved dynamically from RoleColor at render time.
@@ -149,7 +164,7 @@ func RenderCollapsibleToolCard(toolName string, args map[string]interface{}, dur
 	if !success {
 		statusBadge = pal.badgeFailed.Render("FAILED")
 	}
-	durationText := pal.meta.Render(fmt.Sprintf("⏱ %v", duration))
+	durationText := pal.meta.Render(fmt.Sprintf("⏱ %s", formatToolDuration(duration)))
 
 	box := pal.boxSuccess
 	if !success {
@@ -187,7 +202,8 @@ func RenderCollapsibleToolCard(toolName string, args map[string]interface{}, dur
 		sort.Strings(keys)
 		for _, k := range keys {
 			vBytes, _ := json.Marshal(args[k])
-			sb.WriteString(fmt.Sprintf("  • %s: %s\n", pal.key.Render(k), pal.val.Render(string(vBytes))))
+			valPreview := truncateToolLine(string(vBytes), 88)
+			sb.WriteString(fmt.Sprintf("  • %s: %s\n", pal.key.Render(k), pal.val.Render(valPreview)))
 		}
 	}
 
@@ -195,11 +211,15 @@ func RenderCollapsibleToolCard(toolName string, args map[string]interface{}, dur
 		sb.WriteString(pal.meta.Render("Output Preview:") + "\n")
 		lines := strings.Split(strings.TrimSpace(output), "\n")
 		maxLines := 6
+		limit := len(lines)
+		if limit > maxLines {
+			limit = maxLines
+		}
+		for i := 0; i < limit; i++ {
+			sb.WriteString(truncateToolLine(lines[i], 92) + "\n")
+		}
 		if len(lines) > maxLines {
-			preview := strings.Join(lines[:maxLines], "\n")
-			sb.WriteString(preview + "\n" + pal.meta.Render(fmt.Sprintf("... (%d lines truncated)", len(lines)-maxLines)))
-		} else {
-			sb.WriteString(strings.Join(lines, "\n"))
+			sb.WriteString(pal.meta.Render(fmt.Sprintf("... (%d lines truncated)", len(lines)-maxLines)))
 		}
 	}
 

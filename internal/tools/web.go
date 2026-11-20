@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"fmt"
+	"html"
 	"io"
 	"net/http"
 	"net/url"
@@ -63,16 +64,18 @@ func RegisterWebTools(r *Registry) {
 
 		reTitle := regexp.MustCompile(`<a[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>([^<]+)</a>`)
 		reSnippet := regexp.MustCompile(`<a[^>]*class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</a>`)
+		reHTMLTags := regexp.MustCompile(`<[^>]+>`)
 		titleMatches := reTitle.FindAllStringSubmatch(bodyStr, 10)
 		snippetMatches := reSnippet.FindAllStringSubmatch(bodyStr, 10)
 		for i, tm := range titleMatches {
 			if len(tm) >= 3 {
 				item := searchItem{
-					Title: strings.TrimSpace(tm[2]),
-					Link:  strings.TrimSpace(tm[1]),
+					Title: strings.TrimSpace(html.UnescapeString(reHTMLTags.ReplaceAllString(tm[2], ""))),
+					Link:  strings.TrimSpace(html.UnescapeString(tm[1])),
 				}
 				if i < len(snippetMatches) && len(snippetMatches[i]) >= 2 {
-					item.Desc = strings.TrimSpace(strings.ReplaceAll(snippetMatches[i][1], "<b>", ""))
+					cleanDesc := reHTMLTags.ReplaceAllString(snippetMatches[i][1], "")
+					item.Desc = strings.TrimSpace(html.UnescapeString(cleanDesc))
 				}
 				results = append(results, item)
 			}

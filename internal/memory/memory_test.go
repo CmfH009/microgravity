@@ -118,3 +118,18 @@ func TestTokenize(t *testing.T) {
 	}
 	assert.True(t, hasHel, "expected 'hel' trigram in tokens")
 }
+
+func TestShouldInjectMemoryAndFilterRelevant(t *testing.T) {
+	assert.False(t, ShouldInjectMemory("Hello"))
+	assert.False(t, ShouldInjectMemory("hi there"))
+	assert.True(t, ShouldInjectMemory("How do I build a Go worker pool?"))
+
+	results := []rag.SearchResult{
+		{ID: "1", Text: "User: [Relevant context from past sessions]\nHello", Score: 0.99},
+		{ID: "2", Text: "Assistant: unrelated low match", Score: 0.25},
+		{ID: "3", Text: "Assistant: Use sync.WaitGroup for worker pools.", Score: 0.72},
+	}
+	filtered := FilterRelevant(results, 0.45)
+	require.Len(t, filtered, 1)
+	assert.Equal(t, "3", filtered[0].ID)
+}

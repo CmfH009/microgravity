@@ -5,31 +5,85 @@
 [![Go Version](https://img.shields.io/github/go-mod/go-version/CmfH009/microgravity)](https://github.com/CmfH009/microgravity/blob/master/go.mod)
 [![License: MIT](https://img.shields.io/github/license/CmfH009/microgravity)](https://github.com/CmfH009/microgravity/blob/master/LICENSE)
 
-**Microgravity** (`mg`) is an autonomous AI agent CLI and execution environment driven by local (Ollama/Gemma) and cloud-routed (Gemini/Gemma) LLM model architectures, providing full parity with the Google Antigravity (`agy`) CLI ecosystem.
+**Microgravity (`mg`)** is a fast, local-first autonomous AI agent CLI and multi-agent swarm runtime written in Go. It combines local Ollama/GGUF/OpenAI-compatible models with cloud Gemini failover, Model Context Protocol (MCP) extensibility, AST context compression, cross-session semantic memory, and an interactive Bubble Tea TUI.
 
-> **Status:** Active development. Run `go test -race ./...`, `go vet ./...`, and `go build ./...` locally before release.
+```text
+   __  ____                                        _ __
+  /  |/  (_)_____________  ____ __________ __   __(_) /___  __
+ / /|_/ / / ___/ ___/ __ \/ __ `/ ___/ __ `/ | / / / __/ / / /
+/ /  / / / /__/ /  / /_/ / /_/ / /  / /_/ /| |/ / / /_/ /_/ /
+/_/  /_/_/\___/_/   \____/\__, /_/   \__,_/ |___/_/\__/\__, /
+                          /____/                       /____/
+
+    🌌  M I C R O G R A V I T Y   A I   E N V I R O N M E N T
+  Autonomous Copilot Engine • Multimodal Gemma & Gemini Matrix
+```
 
 ---
 
-## ⚡ Key Capabilities & Architecture
+## 🏗️ System Architecture
+
+```mermaid
+flowchart LR
+    CLI["CLI & TUI (cmd/)"] --> Session["Agentic Turn Engine (internal/engine)"]
+    Session --> Router["Hybrid Router (internal/router)"]
+    Router -->|Local / Fast / Heavy| Ollama["Ollama / Local GGUF / OpenAI-Compatible"]
+    Router -->|Cloud / Failover| Cloud["Gemini Cloud API"]
+    Session --> Tools["Tool Executor & Policy (internal/executor, internal/policy)"]
+    Tools --> Builtins["Built-in FS, Shell, Web, Git, Swarm (internal/tools)"]
+    Tools --> MCP["MCP Clients & stdio Server (internal/mcp)"]
+    Session --> Memory["Cross-Session Semantic & Letta Memory (internal/memory)"]
+    Session --> Subagents["Worktree-Isolated Subagents (internal/subagent)"]
+```
+
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for module-level internals.
+
+---
+
+## ⚡ Key Capabilities
 
 - **Full Antigravity (`agy`) Tool Suite Parity**:
   - `run_command` with synchronous wait timeout (`WaitMsBeforeAsync`), asynchronous background task execution, streaming task logs (`.system_generated/tasks/`), and reactive message notifications.
   - `manage_task` (`list`, `kill`, `status`, `send_input`) for inspecting and controlling background processes and piping stdin input.
-  - `invoke_subagent` and `define_subagent` for dynamic subagent role definition and parallel multi-subagent array dispatch.
+  - `invoke_subagent` and `define_subagent` for dynamic subagent role definition and parallel multi-subagent dispatch.
   - `manage_subagents` (`list`, `kill`, `kill_all`) with rich state lifecycles (`running`, `idle`, `waiting_for_input`, `waiting_for_dependents`, `waiting_for_message`, `canceling`, `errored`, `completed`, `killed`).
   - `send_message` for thread-safe inter-agent messaging.
   - `call_mcp_tool` for dynamic lazy and eager MCP tool invocation across connected servers.
   - `search_web` (with query, domain filters, and citation formatting) and `read_url_content` (HTML-to-markdown extraction).
-  - `generate_image` (generates UI mockups, diagrams, and layout artifacts stored directly in the brain artifact registry).
+  - `generate_image` (generates UI mockups, diagrams, and layout artifacts stored in the brain artifact registry).
   - `schedule` (one-shot duration timers with condition triggers `never`, `any`, `<sender-id>`, and recurring cron schedules).
-  - `view_file` (with 1-indexed slicing, 46KB truncation, and `ContentOffset`), `write_to_file` (with `ArtifactMetadata`), `replace_file_content` (with `Instruction`, `Description`, `TargetLintErrorIds`), `grep_search`, `find_by_name`, and `list_dir`.
+  - `view_file` (1-indexed slicing, 46KB truncation, `ContentOffset`), `write_to_file` (with secret-write guard & write-ahead journal), `replace_file_content` (CRLF-aware matching), `grep_search`, `find_by_name`, and `list_dir`.
 - **Conversation Transcripts & Brain Architecture (`~/.gemini/antigravity-cli/brain/`)**:
-  - Full AGY JSONL specification support for `transcript.jsonl` (compact with `truncated_fields`) and `transcript_full.jsonl` (untruncated full steps).
+  - AGY JSONL specification support for `transcript.jsonl` (compact with `truncated_fields`) and `transcript_full.jsonl` (untruncated full steps).
 - **Local-First Multi-Tier & OpenAI-Compatible Routing**:
   - Run 100% offline with `--local` / `--routing-mode local-only` (auto-classifying simple vs. complex prompts across fast/heavy local Ollama models with zero cloud requests), or connect to any OpenAI-compatible server (`llama-server`, LM Studio, vLLM, Ollama `/v1`) via `--base-url` / `MG_OPENAI_BASE_URL`.
-- **Upgraded TUI v2 & Interactive Slash Commands**:
-  - Scrollable streaming viewport, collapsible tool cards (`Tab`), inline unified diff approval modal (`[a]`pprove / `[r]`eject / `[A]`lways allow), live theme switcher (`/theme`), checkpoint rewind picker (`/rewind`), split-pane subagent monitor (`/swarm`), plus `/local`, `/caveman`, `/goal`, `/schedule`, `/plan`, `/grill-me`, `/teamwork-preview`, `/learn`, `/dashboard`, `/fix`, `/ci`, `/rules`, `/mcp`, `/subagents`.
+- **Interactive TUI v2 & Slash Commands**:
+  - Alternate-screen Bubble Tea pickers (`/model`, `/skills`, `/sessions`), scrollable streaming viewport, collapsible tool cards (`Tab`), inline unified diff approval modal (`[a]`pprove / `[r]`eject / `[A]`lways allow), live theme switcher (`/theme`), checkpoint rewind picker (`/rewind`), split-pane subagent monitor (`/swarm`), plus `/local`, `/caveman`, `/goal`, `/schedule`, `/plan`, `/grill-me`, `/teamwork-preview`, `/learn`, `/dashboard`, `/fix`, `/ci`, `/rules`, `/mcp`, `/subagents`.
+
+---
+
+## 🤖 Model Catalog & Hugging Face Hub (GGUF)
+
+Microgravity ships an expanded catalog spanning **Gemini 3 / 2.5 / 2.0 / 1.5**, **Gemma 4 / 3 / 2**, **Orbit personas**, **Qwen 2.5 Coder / Qwen 3**, **DeepSeek-R1 / Coder-V2**, **Llama 3.2 / 3.3**, **Mistral / Devstral**, **Phi-4**, **GPT-OSS**, locally discovered `.gguf` files, and live **Hugging Face Hub** search:
+
+```bash
+# Interactive alternate-screen model selector (Tab to filter, / to search, h for HF search, d to download)
+mg models            # or /model inside chat
+
+# List and filter local, downloaded, or categorized models
+mg models list --local
+mg models list --downloaded --json
+
+# Search Hugging Face GGUF repositories and download the best quantization for your PC's RAM
+mg models search "qwen2.5 coder"
+mg models hf-download Qwen/Qwen2.5-Coder-7B-Instruct-GGUF --select
+mg models auto "qwen2.5 coder" --select
+mg models auto "qwen2.5 coder" --ollama --select
+
+# Inspect or switch active model
+mg models current
+mg models select gemma4:e2b
+```
 
 ---
 
@@ -39,29 +93,32 @@
 | :--- | :--- |
 | `mg` / `microgravity` | Launch the interactive AI agent session |
 | `mg agent` / `agents` | List available built-in and specialized agent roles |
+| `mg audit [--fix]` | Run workspace setup and health audit |
+| `mg budget [--json\|--reset]` | View or reset daily token & cost budget usage |
 | `mg changelog` | Show changelog and release notes |
-| `mg completion [bash\|zsh\|fish\|powershell]` | Generate shell completion scripts |
-| `mg plugin <subcommand>` | Manage plugins (`list`, `import`, `install`, `uninstall`, `enable`, `disable`, `validate`, `link`) |
-| `mg mcp <subcommand>` | Manage MCP servers (`add`, `remove`, `list`, `enable`, `disable`, `inspect`, `discover`, `serve`) |
-| `mg mcp serve` | Run mg as a stdio JSON-RPC MCP server exposing all native tools |
-| `mg update` | Update CLI to latest release |
-| `mg fix [-a 5] [-c]` | Autonomous self-healing test repair & doubt loop |
 | `mg ci [-o .github/workflows]` | Generate production GitHub Actions workflows |
+| `mg completion [bash\|zsh\|fish\|powershell]` | Generate shell completion scripts |
+| `mg compress [file]` | Compress file / AST token pruning |
 | `mg dashboard [--live] [-w] [-p 8085]` | Launch Bubble Tea live TUI & Web Telemetry Control Center |
 | `mg diff [--staged] [--stat] [--file <path>] [--last-session]` | Show styled unified diff of working tree or staged changes |
-| `mg swarm [tasks...]` | Launch parallel worker subagent swarm |
-| `mg compress [file]` | Compress file / AST token pruning |
-| `mg profile [pkg]` | Benchmark and runtime memory profiling |
+| `mg doctor [--json]` | Run diagnostics on config, auth, models, Ollama, MCP, and state |
+| `mg fix [-a 5] [-c]` | Autonomous self-healing test repair & doubt loop |
 | `mg graph [-p] [-s] [-a]` | Render ASCII dependency tree |
-| `mg preview [-p 3000]` | Start hot-reloading web app preview server |
-| `mg skills` | Browse, search, and inspect installed AGY skills |
-| `mg audit [--fix]` | Run workspace setup and health audit |
-| `mg models` | Inspect active local/cloud model endpoints |
-| `mg subagents list` | List active subagent threads |
-| `mg sessions [list\|delete\|export\|import]` | Manage saved chat sessions |
-| `mg sessions export <name> <file> [--format md\|json]` | Export session history as markdown or JSON |
 | `mg install [--dir] [--skip-path]` | Configure environment paths & shell settings |
+| `mg mcp <subcommand>` | Manage MCP servers (`add`, `remove`, `list`, `enable`, `disable`, `inspect`, `discover`, `serve`) |
+| `mg mcp serve` | Run mg as a stdio JSON-RPC MCP server exposing all native tools |
+| `mg memory <query> \| --clear` | Search or clear cross-session semantic memory |
+| `mg models [list\|select\|current\|search\|hf-download\|auto]` | Scan, search, download, and select local/cloud/GGUF models |
+| `mg plugin <subcommand>` | Manage plugins (`list`, `import`, `install`, `uninstall`, `enable`, `disable`, `validate`, `link`) |
+| `mg preview [-p 3000]` | Start hot-reloading web app preview server |
+| `mg profile [pkg]` | Benchmark and runtime memory profiling |
+| `mg replay [<session-id>\|--list\|--interactive]` | Replay recorded AGY JSONL session transcripts |
+| `mg sessions [list\|delete\|export\|import]` | Manage and export (`--format md\|json`) saved chat sessions |
+| `mg skills` | Browse, search, and inspect installed AGY skills |
+| `mg subagents list` | List active subagent threads |
+| `mg swarm [tasks...]` | Launch parallel worker subagent swarm |
 | `mg undo [n]` | Revert the last n file modifications (write-ahead journal) |
+| `mg update` | Update CLI to latest release |
 
 ---
 
@@ -105,7 +162,7 @@ Run Microgravity completely offline without cloud API keys or credits:
 ```bash
 # Local-only multi-tier routing via Ollama (never dials cloud endpoints)
 mg --local
-mg --routing-mode local-only --local-fast-model gemma3:4b --local-heavy-model qwen2.5-coder:7b
+mg --routing-mode local-only --local-fast-model gemma4:e2b --local-heavy-model qwen2.5-coder:7b
 
 # Or set via environment variable
 export MG_ROUTING_MODE=local-only
@@ -122,39 +179,18 @@ export MG_OPENAI_BASE_URL=http://127.0.0.1:11434/v1
 
 | Control / Slash Command | Action |
 | :--- | :--- |
+| `/model` | Open alternate-screen model catalog, filter tabs, and Hugging Face downloader |
 | `/theme [name\|auto]` | Live-switch between `auto`, `dark`, `light`, `tokyo-night`, `catppuccin`, and `high-contrast` |
 | `/rewind` | Open interactive checkpoint picker to inspect and revert workspace turns |
 | `/swarm` | Toggle split-pane subagent/swarm status monitor |
 | `/local` | Toggle local-only routing directly inside an active session |
-| `Tab` | Expand or collapse tool execution cards |
+| `Tab` | Expand or collapse tool execution cards (or cycle filter tabs in `/model`) |
 | `a` / `r` / `A` | Approve once, reject, or always allow in session inside the inline diff approval modal |
 | `PgUp` / `PgDn` / Mouse Wheel | Scroll through conversation and tool output history |
 
 ---
 
-## 🐚 Shell Completions
-
-Generate shell auto-completions for `bash`, `zsh`, `fish`, or `powershell`:
-
-```bash
-# Bash
-source <(mg completion bash)
-
-# Zsh
-mg completion zsh > "${fpath[1]}/_mg"
-
-# Fish
-mg completion fish | source
-```
-
-```powershell
-# PowerShell
-mg completion powershell | Out-String | Invoke-Expression
-```
-
----
-
-## 📦 Build, Releases & Installation
+## 📦 Installation & Builds
 
 ### Install via Go
 
@@ -188,27 +224,37 @@ CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o dist/mg-win
 CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -ldflags="-s -w" -o dist/mg-darwin-arm64 .
 ```
 
-On Windows PowerShell:
-
-```powershell
-$env:CGO_ENABLED="0"; $env:GOOS="windows"; $env:GOARCH="amd64"; go build -ldflags="-s -w" -o dist/mg-windows-amd64.exe .
-```
-
 ### Verification & Tests
 
 ```bash
 go vet ./...
 CGO_ENABLED=1 GEMINI_API_KEY="" GOOGLE_API_KEY="" go test -race -count=1 ./...
+python -m unittest discover -s tests -p "test_*.py"
 ```
 
 ---
 
-## 🎬 Terminal Demo (`vhs`)
+## 📁 Repository Structure
 
-Regenerate the terminal demo recording using [`charmbracelet/vhs`](https://github.com/charmbracelet/vhs):
-
-```bash
-vhs docs/demo.tape
+```text
+microgravity/
+├── cmd/                  # Cobra CLI commands, interactive chat loop, Bubble Tea TUI, MCP stdio server
+├── internal/
+│   ├── engine/           # Turn loop, session state, history persistence, failover dispatch
+│   ├── router/           # Complexity classifier & hybrid/local-only/cloud-only provider routing
+│   ├── models/           # Model catalog, Ollama/GGUF scanner, & Bubble Tea /model picker
+│   ├── huggingface/      # Hugging Face Hub search, GGUF selector & resumable downloader
+│   ├── cloud/ & ollama/ & openai/ # Provider clients, streaming tool-call parsers & retry backoff
+│   ├── tools/ & executor/ & policy/ # Native tool registry, TTL cache, secret guard, write journal
+│   ├── mcp/              # Model Context Protocol stdio/HTTP client & server
+│   ├── memory/ & rag/    # Feature-hashing offline semantic memory (SQLite)
+│   ├── subagent/ & swarm/# Parallel subagents, git worktree isolation & EventBus integration
+│   └── ui/               # Lip Gloss themes, panels, collapsible tool cards, diff modal, sparklines
+├── python/               # Python sidecars (browser tool, Letta memory adapter, EventBus backpressure)
+├── scripts/              # Helper sidecar forwarders and OAuth/CV utilities
+├── tests/                # Go E2E/chaos/benchmark suites and Python unittest suites
+├── vscode-extension/     # Microgravity IDE companion extension
+└── docs/                 # Architecture, specs, roadmaps, and VHS demo tape
 ```
 
 ---

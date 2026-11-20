@@ -146,8 +146,8 @@ var modelsListCmd = &cobra.Command{
 					activeTag = "  [ACTIVE MODEL]"
 				}
 
-				sb.WriteString(fmt.Sprintf("%d. %s [%s]%s  (%s)\n   Status: %s\n   Use Case: %s\n\n",
-					i+1, m.ID, m.RenderBadge(), activeTag, m.Status, m.Status, m.Description))
+				sb.WriteString(fmt.Sprintf("%d. %s [%s]%s\n   Status: %s\n   Use Case: %s\n\n",
+					i+1, m.ID, m.RenderBadge(), activeTag, m.Status, m.Description))
 			}
 		}
 

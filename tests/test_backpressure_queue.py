@@ -18,9 +18,9 @@ import sys
 import unittest
 from pathlib import Path
 
-# Add project root to sys.path
+# Add python/eventbus to sys.path
 root_dir = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(root_dir))
+sys.path.insert(0, str(root_dir / "python" / "eventbus"))
 
 from backpressure_queue import (
     BoundedBackpressureQueue,

@@ -5,12 +5,14 @@
 import asyncio
 import os
 import sys
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-# Add project root to sys.path
+# Add python/browser to sys.path
 root_dir = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(root_dir))
+sys.path.insert(0, str(root_dir / "python" / "browser"))
 
 from mg_tool_browser import BrowserSessionManager, FallbackHTMLParser
 
@@ -48,7 +50,39 @@ class TestFallbackHTMLParser(unittest.TestCase):
         self.assertIn("button", tags)
 
 
+class _MockExampleHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = (
+            b"<!DOCTYPE html><html><head><title>Example Domain</title></head>"
+            b"<body><h1>Example Domain</h1>"
+            b"<p>This domain is for use in documentation examples.</p>"
+            b"<a href=\"https://iana.org\">More information...</a>"
+            b"</body></html>"
+        )
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args):
+        pass
+
+
 class TestBrowserSessionManager(unittest.IsolatedAsyncioTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls._server = ThreadingHTTPServer(("127.0.0.1", 0), _MockExampleHandler)
+        cls._thread = threading.Thread(target=cls._server.serve_forever, daemon=True)
+        cls._thread.start()
+        host, port = cls._server.server_address
+        cls.test_url = f"http://{host}:{port}/"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._server.shutdown()
+        cls._server.server_close()
+
     async def asyncSetUp(self):
         self.session = BrowserSessionManager(headless=True)
 
@@ -56,7 +90,7 @@ class TestBrowserSessionManager(unittest.IsolatedAsyncioTestCase):
         await self.session.close()
 
     async def test_navigate_and_extract(self):
-        res = await self.session.navigate("https://example.com")
+        res = await self.session.navigate(self.test_url)
         self.assertEqual(res["status"], "success")
         self.assertIn("Example Domain", res["title"])
 
@@ -66,13 +100,13 @@ class TestBrowserSessionManager(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(len(extract_res["links"]), 1)
 
     async def test_search_page(self):
-        await self.session.navigate("https://example.com")
+        await self.session.navigate(self.test_url)
         search_res = await self.session.search_page(pattern="documentation examples")
         self.assertEqual(search_res["status"], "success")
         self.assertGreaterEqual(search_res["count"], 1)
 
     async def test_find_elements(self):
-        await self.session.navigate("https://example.com")
+        await self.session.navigate(self.test_url)
         find_res = await self.session.find_elements(selector="a")
         self.assertEqual(find_res["status"], "success")
         self.assertGreaterEqual(find_res["count"], 1)
@@ -83,7 +117,7 @@ class TestBrowserSessionManager(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(tabs_res["tabs"]), 1)
 
         # Navigate with new tab
-        nav2 = await self.session.navigate("https://example.com", new_tab=True)
+        nav2 = await self.session.navigate(self.test_url, new_tab=True)
         self.assertEqual(nav2["status"], "success")
         
         tabs_res2 = await self.session.get_tabs()
@@ -106,7 +140,7 @@ class TestBrowserSessionManager(unittest.IsolatedAsyncioTestCase):
 
     async def test_composite_action_plan(self):
         plan = [
-            {"action": "navigate", "url": "https://example.com"},
+            {"action": "navigate", "url": self.test_url},
             {"action": "search_page", "pattern": "Domain"},
             {"action": "find_elements", "selector": "a"},
         ]

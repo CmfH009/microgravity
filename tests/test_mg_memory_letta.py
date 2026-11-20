@@ -9,9 +9,9 @@ import time
 import unittest
 from pathlib import Path
 
-# Add project root to sys.path
+# Add python/letta to sys.path
 root_dir = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(root_dir))
+sys.path.insert(0, str(root_dir / "python" / "letta"))
 
 from mg_memory_letta import LettaMemoryAdapter, CoreMemory, EpisodicMemory, ArchivalMemory
 

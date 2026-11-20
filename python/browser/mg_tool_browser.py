@@ -294,6 +294,12 @@ class BrowserSessionManager:
 
         await self._ensure_playwright()
 
+        if self._playwright_context is not None and tab_id not in self._playwright_pages:
+            try:
+                self._playwright_pages[tab_id] = await self._playwright_context.new_page()
+            except Exception:
+                pass
+
         if self._browser and tab_id in self._playwright_pages:
             try:
                 page = self._playwright_pages[tab_id]
@@ -711,6 +717,12 @@ class BrowserSessionManager:
             return {"status": "error", "error": "Cannot close the only remaining tab"}
 
         del self.tabs[tab_id]
+        page = self._playwright_pages.pop(tab_id, None)
+        if page is not None:
+            try:
+                await page.close()
+            except Exception:
+                pass
         if self.active_tab_id == tab_id:
             self.active_tab_id = list(self.tabs.keys())[0]
 

@@ -16,6 +16,17 @@ type ReleaseNote struct {
 func GetChangelog() []ReleaseNote {
 	return []ReleaseNote{
 		{
+			Version: "0.2.2",
+			Date:    "2026-11-19",
+			Notes: []string{
+				"Expanded model catalog to 30+ local and cloud models (Gemma 4/3/2, Qwen 2.5/3, DeepSeek-R1/Coder-V2, Llama 3.2/3.3, Mistral/Devstral, Phi-4, GPT-OSS) plus Hugging Face Hub GGUF search and RAM-aware auto-downloader (`mg models search`, `hf-download`, `auto`).",
+				"Overhauled `/model`, `/skills`, and `/sessions` TUI pickers with alternate-screen buffer (`tea.WithAltScreen()`), bounded viewport pagination, clean status coloring, and non-overlapping ANSI formatting.",
+				"Added bounded tool-card line truncation, rounded durations, and clean HTML snippet unescaping for `search_web`.",
+				"Hardened cross-session semantic memory filtering (`ShouldInjectMemory`, `FilterRelevant`) and fixed `mg memory --clear` on Windows.",
+				"Fixed local active-model direct Ollama routing and cold-load `ResponseHeaderTimeout` (3m).",
+			},
+		},
+		{
 			Version: "1.1.18",
 			Date:    "2026-08-22",
 			Notes: []string{

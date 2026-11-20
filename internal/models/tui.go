@@ -172,16 +172,19 @@ func (m model) visibleModels() []ModelInfo {
 
 func (m model) pageSize() int {
 	if m.height <= 0 {
-		return 8
+		return 6
 	}
-	// Reserve ~11 lines for header, tab bar, search/status bar, borders, and footer.
-	availLines := m.height - 11
+	// Reserve ~15 lines for header, tab bar, search/status bar, category headers, borders, and footer.
+	availLines := m.height - 15
 	if availLines < 6 {
 		return 3
 	}
 	slots := availLines / 3
 	if slots < 3 {
 		slots = 3
+	}
+	if slots > 8 {
+		slots = 8
 	}
 	return slots
 }
@@ -573,6 +576,20 @@ func (m model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func formatModelStatus(status string) string {
+	lower := strings.ToLower(status)
+	switch {
+	case strings.Contains(lower, "downloaded"):
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("48")).Render(status)
+	case strings.Contains(lower, "available cloud"):
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Render(status)
+	case strings.Contains(lower, "requires"):
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Render(status)
+	default:
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("245")).Render(status)
+	}
+}
+
 func (m model) View() string {
 	if len(m.catalog) == 0 && len(m.hfModels) == 0 && m.filterTab != filterHuggingFace && !m.hfInputMode {
 		return "No models available in catalog.\nPress 'q' to quit.\n"
@@ -611,7 +628,10 @@ func (m model) View() string {
 	sb.WriteString("\n")
 
 	visible := m.visibleModels()
-	selectedStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("213")).Bold(true)
+	selectedIDStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("213")).Bold(true)
+	selectedDescStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
+	normalIDStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("255")).Bold(true)
+	normalDescStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
 	activeBadgeStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("15")).Background(lipgloss.Color("48")).Bold(true).Padding(0, 1)
 
 	if len(visible) == 0 {
@@ -648,13 +668,20 @@ func (m model) View() string {
 		for i := start; i < end; i++ {
 			item := visible[i]
 			if item.Category != currentCategory && item.Category != "" {
+				if i > start {
+					sb.WriteString("\n")
+				}
 				currentCategory = item.Category
-				sb.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Bold(true).Render("━━━━ "+currentCategory+" ━━━━") + "\n")
+				sb.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Bold(true).Render("  ━━━━ "+currentCategory+" ━━━━") + "\n")
 			}
 
 			cursor := "  "
+			idStyled := normalIDStyle.Render(fmt.Sprintf("%-26s", item.ID))
+			descStyled := normalDescStyle.Render(item.Description)
 			if m.cursor == i {
-				cursor = "❯ "
+				cursor = selectedIDStyle.Render("❯ ")
+				idStyled = selectedIDStyle.Render(fmt.Sprintf("%-26s", item.ID))
+				descStyled = selectedDescStyle.Render(item.Description)
 			}
 
 			activeTag := ""
@@ -662,24 +689,18 @@ func (m model) View() string {
 				activeTag = "  " + activeBadgeStyle.Render("ACTIVE MODEL")
 			}
 
-			line := fmt.Sprintf("%s%-24s %s  (%s)%s\n    %s\n",
-				cursor, item.ID, item.RenderBadge(), item.Status, activeTag, item.Description)
-
-			if m.cursor == i {
-				sb.WriteString(selectedStyle.Render(line) + "\n")
-			} else {
-				sb.WriteString(line + "\n")
-			}
+			sb.WriteString(fmt.Sprintf("%s%s %s  %s%s\n    %s\n",
+				cursor, idStyled, item.RenderBadge(), formatModelStatus(item.Status), activeTag, descStyled))
 		}
 
 		if end < len(visible) {
-			sb.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("243")).Render(fmt.Sprintf("  ▼ %d more below (showing %d-%d of %d)", len(visible)-end, start+1, end, len(visible))) + "\n")
+			sb.WriteString("\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("243")).Render(fmt.Sprintf("  ▼ %d more below (showing %d-%d of %d)", len(visible)-end, start+1, end, len(visible))) + "\n")
 		} else if len(visible) > page {
-			sb.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("243")).Render(fmt.Sprintf("  Showing %d-%d of %d", start+1, end, len(visible))) + "\n")
+			sb.WriteString("\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("243")).Render(fmt.Sprintf("  Showing %d-%d of %d", start+1, end, len(visible))) + "\n")
 		}
 	}
 
-	sb.WriteString("\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("147")).Render("[↑/↓/PgUp/PgDn] Navigate  │  [Tab] Filter  │  [/] Search  │  [h] HF Search  │  [d] Auto-Download  │  [Enter] Select  │  [q/Esc] Quit") + "\n")
+	sb.WriteString("\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("147")).Render("[↑/↓/PgUp/PgDn] Navigate • [Tab] Filter • [/] Search • [h] HF • [d] Download • [Enter] Select • [q] Quit"))
 
 	boxStyle := lipgloss.NewStyle().
 		Border(lipgloss.DoubleBorder()).
@@ -742,7 +763,7 @@ func RunTUIWithDeps(ctx context.Context, scanner *Scanner, hfClient *huggingface
 	}
 	initialModel.clampCursorAndScroll(len(catalog))
 
-	p := tea.NewProgram(initialModel, tea.WithContext(ctx))
+	p := tea.NewProgram(initialModel, tea.WithContext(ctx), tea.WithAltScreen())
 
 	m, err := p.Run()
 	if err != nil {

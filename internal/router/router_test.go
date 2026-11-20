@@ -26,7 +26,7 @@ func TestRouter_Classify(t *testing.T) {
 		{"Long prompt", "can you tell me a very long story about how the world works, explaining all details, and also providing some code snippet representing standard math equations?", ComplexityComplex},
 	}
 
-	r := NewRouter()
+	r := newTestRouter(40)
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got := r.Classify(tt.prompt)
@@ -35,6 +35,12 @@ func TestRouter_Classify(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("High memory >85% escalates simple prompt", func(t *testing.T) {
+		if got := newTestRouter(90).Classify("hi"); got != ComplexityComplex {
+			t.Errorf("Classify(\"hi\") at 90%% RAM = %v; expected %v", got, ComplexityComplex)
+		}
+	})
 }
 
 func TestNormalizeRoutingMode(t *testing.T) {

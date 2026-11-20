@@ -348,3 +348,30 @@ func TestTUI_FilterTabsSearchViewportAndHF(t *testing.T) {
 		t.Fatalf("expected active model set to downloaded GGUF, got %q", got)
 	}
 }
+
+func TestTUI_LayoutFitsViewportAndNoDoubleParens(t *testing.T) {
+	isolateModelsTestEnv(t)
+
+	scanner := NewScannerWithClient(ollama.NewClient("http://127.0.0.1:1"))
+	catalog, err := scanner.Scan(context.Background())
+	if err != nil {
+		t.Fatalf("Scan failed: %v", err)
+	}
+
+	m := model{
+		catalog:  catalog,
+		activeID: "gemma4:e2b",
+	}
+	next, _ := m.Update(tea.WindowSizeMsg{Width: 140, Height: 30})
+	m = next.(model)
+	view := m.View()
+
+	if strings.Contains(view, "((") || strings.Contains(view, "))") {
+		t.Fatalf("unexpected double parentheses in /model View:\n%s", view)
+	}
+
+	lines := strings.Split(strings.TrimSuffix(view, "\n"), "\n")
+	if len(lines) > 30 {
+		t.Fatalf("expected /model View to fit within 30 terminal rows, got %d lines:\n%s", len(lines), view)
+	}
+}

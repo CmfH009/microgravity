@@ -186,7 +186,7 @@ func RunTUI(loaded []*Skill) (*Skill, bool) {
 		skills:   loaded,
 		filtered: loaded,
 		cursor:   0,
-	})
+	}, tea.WithAltScreen())
 
 	m, err := p.Run()
 	if err != nil {

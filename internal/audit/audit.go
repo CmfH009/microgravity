@@ -73,14 +73,16 @@ func AuditWorkspace(dir string) (*ProjectAudit, error) {
 
 	// 4. Check for PLAN.md execution plan
 	if _, err := os.Stat(filepath.Join(dir, "PLAN.md")); os.IsNotExist(err) {
-		audit.Score -= 10
-		audit.Issues = append(audit.Issues, AuditIssue{
-			Category:    "Architecture",
-			Severity:    "WARNING",
-			Description: "Missing master execution plan (PLAN.md)",
-			Fixable:     true,
-			PatchType:   "create_plan",
-		})
+		if _, errDocs := os.Stat(filepath.Join(dir, "docs", "PLAN.md")); os.IsNotExist(errDocs) {
+			audit.Score -= 10
+			audit.Issues = append(audit.Issues, AuditIssue{
+				Category:    "Architecture",
+				Severity:    "WARNING",
+				Description: "Missing master execution plan (PLAN.md)",
+				Fixable:     true,
+				PatchType:   "create_plan",
+			})
+		}
 	}
 
 	// 5. Check for unit tests

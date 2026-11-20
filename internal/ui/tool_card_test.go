@@ -85,3 +85,25 @@ func TestRenderToolCard_DynamicThemeSwitch(t *testing.T) {
 		t.Errorf("expected exported ToolCardBoxSuccess to stay synced with SetTheme")
 	}
 }
+
+func TestRenderToolCallCard_TruncatesLongLinesAndFormatsDuration(t *testing.T) {
+	longQuery := strings.Repeat("word ", 60) // 300 chars with newlines
+	longOutput := strings.Repeat("x", 220) + "\nsecond line"
+	dur := 1645407100 * time.Nanosecond // 1.6454071s -> 1.65s
+
+	card := RenderToolCallCard("search_web", map[string]interface{}{"query": longQuery}, dur, true, longOutput)
+	if !strings.Contains(card, "1.65s") {
+		t.Errorf("expected rounded duration 1.65s, got:\n%s", card)
+	}
+	if strings.Contains(card, "1.6454071s") {
+		t.Errorf("unexpected raw nanosecond duration in card:\n%s", card)
+	}
+	if strings.HasSuffix(card, " ") {
+		t.Errorf("expected no trailing margin space line on card")
+	}
+	for _, line := range strings.Split(card, "\n") {
+		if len([]rune(line)) > 140 {
+			t.Errorf("expected card line width to remain bounded, got %d runes: %s", len([]rune(line)), line)
+		}
+	}
+}
