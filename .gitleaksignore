@@ -1,0 +1,12 @@
+# Verified synthetic unit test fixtures (not real credentials)
+internal/secrets/secrets_test.go:aws-access-token:11
+internal/secrets/secrets_test.go:generic-api-key:12
+internal/secrets/secrets_test.go:github-pat:12
+internal/secrets/secrets_test.go:gcp-api-key:13
+internal/secrets/secrets_test.go:slack-legacy-bot-token:14
+internal/secrets/secrets_test.go:jwt:16
+internal/secrets/secrets_test.go:aws-access-token:68
+internal/secrets/secrets_test.go:aws-access-token:88
+internal/tools/secrets_guard_test.go:aws-access-token:44
+internal/tools/secrets_guard_test.go:aws-access-token:60
+internal/preview/server_test.go:generic-api-key:98
