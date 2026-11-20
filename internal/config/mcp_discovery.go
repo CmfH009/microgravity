@@ -17,6 +17,7 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -63,14 +64,81 @@ func DiscoverMCPServers() []candidateServer {
 	// 5. pipx-based mcp-server-* packages
 	candidates = append(candidates, discoverFromPipx()...)
 
-	// Deduplicate by entry name
-	seen := make(map[string]bool)
-	var deduped []candidateServer
-	for _, c := range candidates {
-		if !seen[c.Entry.Name] {
-			seen[c.Entry.Name] = true
-			deduped = append(deduped, c)
+	return deduplicateCandidates(candidates)
+}
+
+// canonicalCapabilityName normalizes an MCP server entry name to its canonical
+// capability identifier (e.g., "filesystem-pipx" -> "filesystem").
+func canonicalCapabilityName(name string) string {
+	n := strings.ToLower(strings.TrimSpace(name))
+	return strings.TrimSuffix(n, "-pipx")
+}
+
+// canonicalServerSignature builds a deterministic signature from a server's URL
+// or command+args so duplicate servers across discovery sources collapse cleanly.
+func canonicalServerSignature(entry MCPServerEntry) string {
+	if rawURL := strings.TrimSpace(entry.URL); rawURL != "" {
+		if parsed, err := url.Parse(rawURL); err == nil && parsed.Scheme != "" && parsed.Host != "" {
+			parsed.Scheme = strings.ToLower(parsed.Scheme)
+			parsed.Host = strings.ToLower(parsed.Host)
+			parsed.Path = strings.TrimRight(parsed.Path, "/")
+			return "url:" + parsed.String()
 		}
+		return "url:" + strings.TrimRight(strings.ToLower(rawURL), "/")
+	}
+
+	cmd := strings.ToLower(strings.TrimSpace(entry.Command))
+	if cmd == "" {
+		return ""
+	}
+	parts := make([]string, 0, 1+len(entry.Args))
+	parts = append(parts, cmd)
+	for _, a := range entry.Args {
+		if trimmed := strings.TrimSpace(a); trimmed != "" {
+			parts = append(parts, trimmed)
+		}
+	}
+	return "cmd:" + strings.Join(parts, "\x00")
+}
+
+// deduplicateCandidates collapses duplicate MCP server candidates by:
+// (a) exact Entry.Name,
+// (b) canonical capability name (case-insensitive, stripping "-pipx"), and
+// (c) canonical command+args or URL signature.
+func deduplicateCandidates(candidates []candidateServer) []candidateServer {
+	seenName := make(map[string]bool)
+	seenCap := make(map[string]bool)
+	seenSig := make(map[string]bool)
+	var deduped []candidateServer
+
+	for _, c := range candidates {
+		name := strings.TrimSpace(c.Entry.Name)
+		capName := canonicalCapabilityName(name)
+		sig := canonicalServerSignature(c.Entry)
+
+		if (name != "" && seenName[name]) || (capName != "" && seenCap[capName]) {
+			continue
+		}
+		if sig != "" && seenSig[sig] {
+			if name != "" {
+				seenName[name] = true
+			}
+			if capName != "" {
+				seenCap[capName] = true
+			}
+			continue
+		}
+
+		if name != "" {
+			seenName[name] = true
+		}
+		if capName != "" {
+			seenCap[capName] = true
+		}
+		if sig != "" {
+			seenSig[sig] = true
+		}
+		deduped = append(deduped, c)
 	}
 	return deduped
 }

@@ -141,8 +141,8 @@ func TestDiscoverFromUserConfig(t *testing.T) {
 func TestApproveDiscovery(t *testing.T) {
 	// Use a temp config dir
 	home := t.TempDir()
-	os.Setenv("HOME", home)
-	defer os.Unsetenv("HOME")
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
 
 	configDir := filepath.Join(home, ".microgravity")
 	os.MkdirAll(configDir, 0755)
@@ -194,9 +194,16 @@ func TestApproveDiscovery(t *testing.T) {
 }
 
 func TestDiscoverDeduplication(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+
+	origDir, _ := os.Getwd()
+	defer func() { _ = os.Chdir(origDir) }()
+	_ = os.Chdir(t.TempDir())
+
 	// Set env var with same server as npx would discover
-	os.Setenv("MG_MCP_SERVERS", "npx -y @modelcontextprotocol/server-filesystem")
-	defer os.Unsetenv("MG_MCP_SERVERS")
+	t.Setenv("MG_MCP_SERVERS", "npx -y @modelcontextprotocol/server-filesystem")
 
 	candidates := DiscoverMCPServers()
 	names := make(map[string]bool)
@@ -206,14 +213,130 @@ func TestDiscoverDeduplication(t *testing.T) {
 		}
 		names[c.Entry.Name] = true
 	}
-	// filesystem should only appear once
+	// filesystem should only appear once across env, npx, and pipx
 	count := 0
 	for _, c := range candidates {
-		if strings.Contains(c.Entry.Name, "filesystem") {
+		if strings.Contains(strings.ToLower(c.Entry.Name), "filesystem") ||
+			strings.Contains(strings.Join(c.Entry.Args, " "), "filesystem") {
 			count++
 		}
 	}
 	if count > 1 {
-		t.Errorf("expected at most 1 filesystem server, got %d", count)
+		t.Errorf("expected at most 1 filesystem server, got %d (%+v)", count, candidates)
+	}
+}
+
+func TestDeduplicateCandidates_OverlappingSources(t *testing.T) {
+	candidates := []candidateServer{
+		{
+			Entry: MCPServerEntry{
+				Name:    "npx",
+				Command: "npx",
+				Args:    []string{"-y", "@modelcontextprotocol/server-filesystem"},
+				Type:    "stdio",
+				Enabled: true,
+			},
+			Source: srcEnv,
+		},
+		{
+			Entry: MCPServerEntry{
+				Name:    "filesystem",
+				Command: "npx",
+				Args:    []string{"-y", "@modelcontextprotocol/server-filesystem"},
+				Type:    "stdio",
+				Enabled: true,
+			},
+			Source: srcNpx,
+		},
+		{
+			Entry: MCPServerEntry{
+				Name:    "filesystem-pipx",
+				Command: "pipx",
+				Args:    []string{"run", "mcp-server-filesystem"},
+				Type:    "stdio",
+				Enabled: true,
+			},
+			Source: srcPipx,
+		},
+		{
+			Entry: MCPServerEntry{
+				Name:    "memory",
+				Command: "npx",
+				Args:    []string{"-y", "@modelcontextprotocol/server-memory"},
+				Type:    "stdio",
+				Enabled: true,
+			},
+			Source: srcNpx,
+		},
+		{
+			Entry: MCPServerEntry{
+				Name:    "memory-pipx",
+				Command: "pipx",
+				Args:    []string{"run", "mcp-server-memory"},
+				Type:    "stdio",
+				Enabled: true,
+			},
+			Source: srcPipx,
+		},
+		{
+			Entry: MCPServerEntry{
+				Name:    "custom",
+				Command: "node",
+				Args:    []string{"server-a.js"},
+				Type:    "stdio",
+				Enabled: true,
+			},
+			Source: srcWorkspace,
+		},
+		{
+			Entry: MCPServerEntry{
+				Name:    "custom",
+				Command: "node",
+				Args:    []string{"server-b.js"},
+				Type:    "stdio",
+				Enabled: true,
+			},
+			Source: srcUserConfig,
+		},
+		{
+			Entry: MCPServerEntry{
+				Name:    "other-b",
+				Command: "node",
+				Args:    []string{"server-b.js"},
+				Type:    "stdio",
+				Enabled: true,
+			},
+			Source: srcUserConfig,
+		},
+		{
+			Entry: MCPServerEntry{
+				Name:    "remote-env",
+				Type:    "http",
+				URL:     "HTTP://LocalHost:8765/mcp/",
+				Enabled: true,
+			},
+			Source: srcEnv,
+		},
+		{
+			Entry: MCPServerEntry{
+				Name:    "remote-ws",
+				Type:    "http",
+				URL:     "http://localhost:8765/mcp",
+				Enabled: true,
+			},
+			Source: srcWorkspace,
+		},
+	}
+
+	got := deduplicateCandidates(candidates)
+	expectedNames := []string{"npx", "memory", "custom", "other-b", "remote-env"}
+	if len(got) != len(expectedNames) {
+		t.Fatalf("expected %d deduplicated candidates, got %d: %+v", len(expectedNames), len(got), got)
+	}
+
+	for i, want := range expectedNames {
+		if got[i].Entry.Name != want {
+			t.Errorf("candidate[%d]: expected name %q, got %q", i, want, got[i].Entry.Name)
+		}
 	}
 }
