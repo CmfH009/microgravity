@@ -229,6 +229,12 @@ func generateWithFailover(ctx context.Context, p turnDispatchParams) (genOutcome
 		return callCloud(p.activeModel)
 	}
 
+	// If the active model is explicitly a local Ollama model (not Gemini/Cloud Gemma),
+	// route directly to Ollama without dialing Cloud APIs.
+	if p.activeModel != "" && !isCloudModelName(p.activeModel) {
+		return callOllama(p.activeModel)
+	}
+
 	// Automatic Hybrid Routing
 	var ollamaErr error
 	ollamaTried := false
@@ -262,6 +268,11 @@ func generateWithFailover(ctx context.Context, p turnDispatchParams) (genOutcome
 		return outLocal, nil
 	}
 	return genOutcome{}, fmt.Errorf("cloud failed (%w); ollama fallback failed (%w)", errCloud, errLocal)
+}
+
+func isCloudModelName(modelID string) bool {
+	lower := strings.ToLower(strings.TrimSpace(modelID))
+	return strings.HasPrefix(lower, "gemini-") || strings.HasPrefix(lower, "gemma-2-") || lower == "flash" || lower == "pro"
 }
 
 // RunPrompt executes a single turn or non-interactive prompt through the full engine pipeline.

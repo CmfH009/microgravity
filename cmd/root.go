@@ -118,12 +118,18 @@ func shouldSkipCloudAuth(cfg *config.Config, localFlag bool, routingModeFlag, ba
 	if resolveOpenAIBaseURL(cfg, baseURLFlag) != "" {
 		return true
 	}
+	if rootModel != "" && !isCloudModelID(rootModel) {
+		return true
+	}
+	if rootModel == "" && cfg != nil && strings.TrimSpace(cfg.ActiveModel) != "" && !isCloudModelID(cfg.ActiveModel) {
+		return true
+	}
 	return false
 }
 
 func isCloudModelID(modelID string) bool {
 	lower := strings.ToLower(strings.TrimSpace(modelID))
-	return strings.HasPrefix(lower, "gemini-") || lower == "flash" || lower == "pro"
+	return strings.HasPrefix(lower, "gemini-") || strings.HasPrefix(lower, "gemma-2-") || lower == "flash" || lower == "pro"
 }
 
 var rootCmd = &cobra.Command{
@@ -254,7 +260,7 @@ func executePrintMode(prompt string) {
 				opts.LocalFastModel = rootModel
 			}
 		}
-	} else if strings.HasPrefix(activeID, "orbit-") || strings.HasPrefix(activeID, "gemma") || strings.Contains(activeID, ":") {
+	} else if activeID != "" && !isCloudModelID(activeID) {
 		opts.LocalModelName = activeID
 		opts.ExplicitProvider = "ollama"
 	} else if isCloudModelID(activeID) {

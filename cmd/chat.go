@@ -183,12 +183,14 @@ var chatCmd = &cobra.Command{
 		}()
 
 		cfgDisk, _ := config.LoadConfig()
-		activeModelID := config.GetActiveModel()
+		activeModelID := strings.TrimSpace(config.GetActiveModel())
 		if rootModel != "" {
-			activeModelID = rootModel
+			activeModelID = strings.TrimSpace(rootModel)
 		}
-		if activeModelID != "" {
+		if activeModelID != "" && isCloudModelID(activeModelID) {
 			cloudModel = activeModelID
+		} else if activeModelID != "" {
+			modelName = activeModelID
 		}
 
 		routingMode := resolveRoutingMode(cfgDisk, rootLocal, rootRoutingMode)
@@ -205,7 +207,7 @@ var chatCmd = &cobra.Command{
 
 		opts := SessionOptions{
 			SessionName:     sessionName,
-			ActiveModel:     cloudModel,
+			ActiveModel:     activeModelID,
 			LocalModelName:  modelName,
 			CloudModelName:  cloudModel,
 			OllamaBaseURL:   baseURL,
@@ -221,15 +223,19 @@ var chatCmd = &cobra.Command{
 			Sandbox:         rootSandbox,
 			DryRun:          rootDryRun,
 		}
+		if opts.ActiveModel == "" {
+			opts.ActiveModel = cloudModel
+		}
 		if openAIBaseURL != "" {
 			opts.ExplicitProvider = "openai"
 			if rootModel != "" {
 				opts.OpenAIModel = rootModel
 			}
-		} else if rootModel != "" && !isCloudModelID(rootModel) {
-			opts.LocalModelName = rootModel
+		} else if activeModelID != "" && !isCloudModelID(activeModelID) {
+			opts.ExplicitProvider = "ollama"
+			opts.LocalModelName = activeModelID
 			if opts.LocalFastModel == "" {
-				opts.LocalFastModel = rootModel
+				opts.LocalFastModel = activeModelID
 			}
 		}
 
@@ -270,6 +276,8 @@ var chatCmd = &cobra.Command{
 		displayModel := cloudModel
 		if opts.OpenAIBaseURL != "" && opts.OpenAIModel != "" {
 			displayModel = opts.OpenAIModel
+		} else if opts.ExplicitProvider == "ollama" && opts.LocalModelName != "" {
+			displayModel = opts.LocalModelName
 		} else if opts.RoutingMode == string(router.ModeLocalOnly) && opts.LocalFastModel != "" {
 			displayModel = opts.LocalFastModel
 		}

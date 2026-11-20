@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -756,4 +757,65 @@ func TestTurn_SetRoutingModeConcurrent_Race(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
+}
+
+func TestTurn_LocalActiveModel_HybridNeverCallsCloud(t *testing.T) {
+	isolateEngineTestEnv(t)
+
+	var cloudHits int32
+	cloudSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&cloudHits, 1)
+		w.WriteHeader(http.StatusPaymentRequired)
+	}))
+	defer cloudSrv.Close()
+
+	var ollamaHits int32
+	var gotModel string
+	var mu sync.Mutex
+	ollamaSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&ollamaHits, 1)
+		bodyBytes, _ := io.ReadAll(r.Body)
+		var payload map[string]interface{}
+		_ = json.Unmarshal(bodyBytes, &payload)
+		mu.Lock()
+		gotModel, _ = payload["model"].(string)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		_, _ = w.Write([]byte(`{"message":{"role":"assistant","content":"local orbit-thinker reply"},"done":true}` + "\n"))
+	}))
+	defer ollamaSrv.Close()
+
+	sess, err := engine.NewSession(engine.SessionConfig{
+		SessionName:   "local-active-model-hybrid",
+		ActiveModel:   "orbit-thinker:latest",
+		RoutingMode:   "hybrid",
+		OllamaBaseURL: ollamaSrv.URL,
+		CoreMemory:    "<core_memory></core_memory>",
+	})
+	if err != nil {
+		t.Fatalf("NewSession failed: %v", err)
+	}
+	defer sess.Close()
+	sess.CloudClient = cloud.NewClient()
+	sess.CloudClient.APIKey = "test-key"
+	sess.CloudClient.BaseURL = cloudSrv.URL
+
+	resp, err := sess.ExecuteTurn(context.Background(), "architect and refactor this service", nil, ioDiscard{})
+	if err != nil {
+		t.Fatalf("ExecuteTurn failed: %v", err)
+	}
+	if !strings.Contains(resp, "local orbit-thinker reply") {
+		t.Fatalf("unexpected response: %q", resp)
+	}
+	if atomic.LoadInt32(&cloudHits) != 0 {
+		t.Fatalf("expected 0 cloud hits for local ActiveModel orbit-thinker:latest, got %d", cloudHits)
+	}
+	if atomic.LoadInt32(&ollamaHits) != 1 {
+		t.Fatalf("expected 1 ollama hit, got %d", ollamaHits)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if gotModel != "orbit-thinker:latest" {
+		t.Fatalf("expected ollama model orbit-thinker:latest, got %q", gotModel)
+	}
 }

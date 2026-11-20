@@ -258,3 +258,30 @@ func TestCompleterAndSlashLocalAndTheme(t *testing.T) {
 		t.Fatalf("expected unknown theme error, got %q", badTheme)
 	}
 }
+
+func TestShouldSkipCloudAuth_LocalActiveModel(t *testing.T) {
+	origRootModel := rootModel
+	t.Cleanup(func() { rootModel = origRootModel })
+	rootModel = ""
+
+	cases := []struct {
+		name   string
+		active string
+		want   bool
+	}{
+		{"local orbit-thinker skips cloud auth", "orbit-thinker:latest", true},
+		{"local qwen skips cloud auth", "qwen2.5-coder:7b", true},
+		{"cloud gemini requires cloud auth", "gemini-3.6-flash", false},
+		{"cloud gemma-2 requires cloud auth", "gemma-2-27b-it", false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &config.Config{ActiveModel: tc.active}
+			got := shouldSkipCloudAuth(cfg, false, "", "")
+			if got != tc.want {
+				t.Fatalf("shouldSkipCloudAuth(ActiveModel=%q) = %v, want %v", tc.active, got, tc.want)
+			}
+		})
+	}
+}
