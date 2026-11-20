@@ -34,33 +34,26 @@ func LoadFromFiles(globalPath, workspacePath string) (*Rules, error) {
 	return r, nil
 }
 
-// LoadDefaultRules loads rules with full AGY workspace traversal (.agents/AGENTS.md, USER_PROFILE.md, AGENT_PROFILE.md).
+// LoadDefaultRules loads rules with portable workspace traversal (.agents/AGENTS.md, user/agent profiles, and rules.md).
 func LoadDefaultRules(cwd string) (*Rules, error) {
 	home, err := os.UserHomeDir()
+	if err != nil {
+		home = ""
+	}
 	r := &Rules{}
 
-	if err == nil {
+	if home != "" {
 		// Global rules
 		globalPath := filepath.Join(home, ".microgravity", "rules.md")
 		if data, err := os.ReadFile(globalPath); err == nil {
 			r.GlobalContent = strings.TrimSpace(string(data))
 		}
-
-		// User profile
-		userProfPath := filepath.Join(home, ".gemini", "antigravity-cli", "user_profile.md")
-		if _, errStat := os.Stat(userProfPath); os.IsNotExist(errStat) {
-			userProfPath = filepath.Join("C:\\AgyHut", "USER_PROFILE.md")
-		}
-		if data, err := os.ReadFile(userProfPath); err == nil {
-			r.UserProfile = strings.TrimSpace(string(data))
-		}
-
-		// Agent profile
-		agentProfPath := filepath.Join("C:\\AgyHut", "AGENT_PROFILE.md")
-		if data, err := os.ReadFile(agentProfPath); err == nil {
-			r.AgentProfile = strings.TrimSpace(string(data))
-		}
 	}
+
+	// User and agent profiles (discovered portably via MG_HOME, AGY_HOME, ~/.microgravity/, ~/.gemini/antigravity-cli/)
+	searchDirs := profileSearchDirs(home)
+	r.UserProfile = readFirstProfileFile(searchDirs, "user_profile.md", "USER_PROFILE.md")
+	r.AgentProfile = readFirstProfileFile(searchDirs, "agent_profile.md", "AGENT_PROFILE.md")
 
 	// Traversal for .agents/AGENTS.md upwards from cwd
 	curr := cwd
@@ -124,4 +117,44 @@ func (r *Rules) FormatForSystemPrompt() string {
 
 	sb.WriteString("</USER_RULES>\n")
 	return sb.String()
+}
+
+func profileSearchDirs(home string) []string {
+	var dirs []string
+	seen := make(map[string]bool)
+	add := func(dir string) {
+		dir = strings.TrimSpace(dir)
+		if dir == "" {
+			return
+		}
+		clean := filepath.Clean(dir)
+		if !seen[clean] {
+			seen[clean] = true
+			dirs = append(dirs, clean)
+		}
+	}
+
+	add(os.Getenv("MG_HOME"))
+	add(os.Getenv("AGY_HOME"))
+	if home != "" {
+		add(filepath.Join(home, ".microgravity"))
+		add(filepath.Join(home, ".gemini", "antigravity-cli"))
+	}
+	return dirs
+}
+
+func readFirstProfileFile(dirs []string, filenames ...string) string {
+	for _, dir := range dirs {
+		for _, name := range filenames {
+			p := filepath.Join(dir, name)
+			info, err := os.Stat(p)
+			if err != nil || info.IsDir() {
+				continue
+			}
+			if data, err := os.ReadFile(p); err == nil {
+				return strings.TrimSpace(string(data))
+			}
+		}
+	}
+	return ""
 }

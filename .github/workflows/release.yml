@@ -14,10 +14,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache: true
@@ -34,14 +34,96 @@ jobs:
           cd dist
           sha256sum mg-windows-amd64.exe mg-linux-amd64 mg-darwin-arm64 > checksums.txt
 
+      - name: Generate Homebrew formula and Scoop manifest
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          SHA_WINDOWS=$(awk '$2 == "mg-windows-amd64.exe" {print $1}' dist/checksums.txt)
+          SHA_LINUX=$(awk '$2 == "mg-linux-amd64" {print $1}' dist/checksums.txt)
+          SHA_DARWIN=$(awk '$2 == "mg-darwin-arm64" {print $1}' dist/checksums.txt)
+          test -n "${TAG}" && test -n "${VERSION}"
+          test -n "${SHA_WINDOWS}" && test -n "${SHA_LINUX}" && test -n "${SHA_DARWIN}"
+
+          cat > dist/microgravity.rb <<EOF
+          class Microgravity < Formula
+            desc "Autonomous AI agent CLI driven by local Ollama/Gemma and cloud Gemini models"
+            homepage "https://github.com/CmfH009/microgravity"
+            version "${VERSION}"
+            license "MIT"
+
+            on_macos do
+              on_arm do
+                url "https://github.com/CmfH009/microgravity/releases/download/${TAG}/mg-darwin-arm64"
+                sha256 "${SHA_DARWIN}"
+              end
+            end
+
+            on_linux do
+              on_intel do
+                url "https://github.com/CmfH009/microgravity/releases/download/${TAG}/mg-linux-amd64"
+                sha256 "${SHA_LINUX}"
+              end
+            end
+
+            def install
+              if OS.mac?
+                bin.install "mg-darwin-arm64" => "mg"
+              elsif OS.linux?
+                bin.install "mg-linux-amd64" => "mg"
+              end
+            end
+
+            test do
+              assert_match "microgravity", shell_output("#{bin}/mg --help")
+            end
+          end
+          EOF
+
+          python3 - "${TAG}" "${VERSION}" "${SHA_WINDOWS}" <<'PYEOF'
+          import json, sys
+
+          tag, version, sha_windows = sys.argv[1], sys.argv[2], sys.argv[3]
+          manifest = {
+              "version": version,
+              "description": "Autonomous AI agent CLI driven by local Ollama/Gemma and cloud Gemini models",
+              "homepage": "https://github.com/CmfH009/microgravity",
+              "license": "MIT",
+              "architecture": {
+                  "64bit": {
+                      "url": f"https://github.com/CmfH009/microgravity/releases/download/{tag}/mg-windows-amd64.exe#/mg.exe",
+                      "hash": sha_windows,
+                  }
+              },
+              "bin": "mg.exe",
+              "checkver": {
+                  "github": "https://github.com/CmfH009/microgravity"
+              },
+              "autoupdate": {
+                  "architecture": {
+                      "64bit": {
+                          "url": "https://github.com/CmfH009/microgravity/releases/download/v$version/mg-windows-amd64.exe#/mg.exe"
+                      }
+                  },
+                  "hash": {
+                      "url": "$baseurl/checksums.txt"
+                  },
+              },
+          }
+          with open("dist/microgravity.json", "w", encoding="utf-8") as f:
+              json.dump(manifest, f, indent=2)
+              f.write("\n")
+          PYEOF
+
       - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             dist/mg-windows-amd64.exe
             dist/mg-linux-amd64
             dist/mg-darwin-arm64
             dist/checksums.txt
+            dist/microgravity.rb
+            dist/microgravity.json
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

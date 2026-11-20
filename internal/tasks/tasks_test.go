@@ -3,6 +3,7 @@ package tasks
 import (
 	"context"
 	"os"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -56,7 +57,11 @@ func TestTaskManagerBackgroundAndKill(t *testing.T) {
 
 	ctx := context.Background()
 	// Launch command that sleeps
-	res, err := mgr.Launch(ctx, "Start-Sleep -Seconds 5", tempDir, 200, "test-conv")
+	sleepCmd := "sleep 5"
+	if runtime.GOOS == "windows" {
+		sleepCmd = "Start-Sleep -Seconds 5"
+	}
+	res, err := mgr.Launch(ctx, sleepCmd, tempDir, 200, "test-conv")
 	if err != nil {
 		t.Fatalf("Launch failed: %v", err)
 	}
