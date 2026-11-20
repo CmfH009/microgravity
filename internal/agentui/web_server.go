@@ -1,83 +1,278 @@
 package agentui
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
+	"net/url"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
 )
 
-var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool {
+func checkOrigin(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
 		return true
-	},
+	}
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if scheme != "http" && scheme != "https" && scheme != "ws" && scheme != "wss" {
+		return false
+	}
+	if u.User != nil {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	switch host {
+	case "localhost", "127.0.0.1", "::1":
+		return true
+	default:
+		return false
+	}
+}
+
+var upgrader = websocket.Upgrader{
+	CheckOrigin: checkOrigin,
+}
+
+type wsClient struct {
+	conn      *websocket.Conn
+	send      chan []byte
+	done      chan struct{}
+	closeOnce sync.Once
+}
+
+func newWSClient(conn *websocket.Conn) *wsClient {
+	return &wsClient{
+		conn: conn,
+		send: make(chan []byte, 256),
+		done: make(chan struct{}),
+	}
+}
+
+func (c *wsClient) close() {
+	c.closeOnce.Do(func() {
+		close(c.done)
+		_ = c.conn.Close()
+	})
+}
+
+func (c *wsClient) enqueue(msg []byte) bool {
+	select {
+	case <-c.done:
+		return false
+	default:
+	}
+	select {
+	case c.send <- msg:
+		return true
+	case <-c.done:
+		return false
+	default:
+		return false
+	}
 }
 
 type TelemetryServer struct {
+	mu         sync.RWMutex
 	port       int
+	listener   net.Listener
 	httpServer *http.Server
-	clients    map[*websocket.Conn]bool
-	clientsMu  sync.Mutex
-	broadcast  chan []byte
-	stopChan   chan struct{}
+	started    bool
+	stopped    bool
+	startErr   error
+
+	clients   map[*wsClient]bool
+	clientsMu sync.Mutex
+
+	broadcast chan []byte
+	stopChan  chan struct{}
+	stopOnce  sync.Once
+	stopErr   error
+
+	readyChan chan struct{}
+	readyOnce sync.Once
+
+	wg sync.WaitGroup
 }
 
 func NewTelemetryServer(port int) *TelemetryServer {
-	if port <= 0 {
+	if port < 0 {
 		port = 8085
 	}
 	return &TelemetryServer{
 		port:      port,
-		clients:   make(map[*websocket.Conn]bool),
-		broadcast: make(chan []byte, 100),
+		clients:   make(map[*wsClient]bool),
+		broadcast: make(chan []byte, 256),
 		stopChan:  make(chan struct{}),
+		readyChan: make(chan struct{}),
 	}
 }
 
+func (s *TelemetryServer) signalReady() {
+	s.readyOnce.Do(func() {
+		close(s.readyChan)
+	})
+}
+
+// Ready returns a channel closed once the server listener has bound (or failed/stopped).
+func (s *TelemetryServer) Ready() <-chan struct{} {
+	return s.readyChan
+}
+
+// StartErr returns any early startup/listen error recorded before Ready() closed.
+func (s *TelemetryServer) StartErr() error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.startErr
+}
+
+// Port returns the bound loopback TCP port (or configured port before Start).
 func (s *TelemetryServer) Port() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return s.port
 }
 
 func (s *TelemetryServer) Start() error {
+	s.mu.Lock()
+	if s.stopped {
+		s.startErr = http.ErrServerClosed
+		s.mu.Unlock()
+		s.signalReady()
+		return http.ErrServerClosed
+	}
+	if s.started {
+		s.mu.Unlock()
+		return fmt.Errorf("telemetry server already started")
+	}
+	s.started = true
+	listenPort := s.port
+	s.mu.Unlock()
+
+	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", listenPort))
+	if err != nil {
+		s.mu.Lock()
+		s.startErr = err
+		s.mu.Unlock()
+		s.signalReady()
+		return err
+	}
+
+	boundPort := listenPort
+	if tcpAddr, ok := ln.Addr().(*net.TCPAddr); ok {
+		boundPort = tcpAddr.Port
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", s.handleWS)
 	mux.HandleFunc("/api/telemetry", s.handleTelemetryAPI)
 	mux.HandleFunc("/api/rag/search", s.handleRAGSearchAPI)
 	mux.HandleFunc("/", s.handleDashboardHTML)
 
-	s.httpServer = &http.Server{
-		Addr:    fmt.Sprintf(":%d", s.port),
-		Handler: mux,
+	srv := &http.Server{
+		Addr:              ln.Addr().String(),
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
 	}
 
+	s.mu.Lock()
+	if s.stopped {
+		s.mu.Unlock()
+		_ = ln.Close()
+		s.signalReady()
+		return http.ErrServerClosed
+	}
+	s.port = boundPort
+	s.listener = ln
+	s.httpServer = srv
+	s.wg.Add(2)
 	go s.listenBroadcast()
 	go s.autoBroadcastLoop()
+	s.mu.Unlock()
 
-	return s.httpServer.ListenAndServe()
+	s.signalReady()
+
+	err = srv.Serve(ln)
+	if err != nil && !errors.Is(err, http.ErrServerClosed) {
+		_ = s.Stop()
+	}
+	return err
 }
 
 func (s *TelemetryServer) Stop() error {
-	close(s.stopChan)
+	s.stopOnce.Do(func() {
+		s.mu.Lock()
+		s.stopped = true
+		srv := s.httpServer
+		ln := s.listener
+		s.mu.Unlock()
+
+		close(s.stopChan)
+		s.signalReady()
+
+		if srv != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			if err := srv.Shutdown(ctx); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				s.stopErr = srv.Close()
+			}
+		} else if ln != nil {
+			s.stopErr = ln.Close()
+		}
+
+		s.clientsMu.Lock()
+		for c := range s.clients {
+			c.close()
+			delete(s.clients, c)
+		}
+		s.clientsMu.Unlock()
+
+		s.wg.Wait()
+	})
+	return s.stopErr
+}
+
+// Broadcast queues a serialized telemetry message for all connected WebSocket clients.
+func (s *TelemetryServer) Broadcast(msg []byte) {
+	if len(msg) == 0 {
+		return
+	}
+	select {
+	case <-s.stopChan:
+		return
+	default:
+	}
+	select {
+	case s.broadcast <- msg:
+	case <-s.stopChan:
+	default:
+	}
+}
+
+func (s *TelemetryServer) removeClient(c *wsClient) {
 	s.clientsMu.Lock()
-	for client := range s.clients {
-		_ = client.Close()
-		delete(s.clients, client)
-	}
+	delete(s.clients, c)
 	s.clientsMu.Unlock()
-	if s.httpServer != nil {
-		return s.httpServer.Close()
-	}
-	return nil
 }
 
 func (s *TelemetryServer) handleTelemetryAPI(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	query := r.URL.Query().Get("q")
 	data := GetDashboardTelemetry(query)
-	json.NewEncoder(w).Encode(data)
+	_ = json.NewEncoder(w).Encode(data)
 }
 
 func (s *TelemetryServer) handleRAGSearchAPI(w http.ResponseWriter, r *http.Request) {
@@ -87,7 +282,7 @@ func (s *TelemetryServer) handleRAGSearchAPI(w http.ResponseWriter, r *http.Requ
 		query = "agent workflow"
 	}
 	ragData := GetRAGTelemetry(query)
-	json.NewEncoder(w).Encode(ragData)
+	_ = json.NewEncoder(w).Encode(ragData)
 }
 
 func (s *TelemetryServer) handleWS(w http.ResponseWriter, r *http.Request) {
@@ -95,27 +290,59 @@ func (s *TelemetryServer) handleWS(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
-	s.clientsMu.Lock()
-	s.clients[conn] = true
-	s.clientsMu.Unlock()
+	c := newWSClient(conn)
 
-	// Start reader pump to detect client close/disconnection
-	go func() {
-		defer func() {
-			s.clientsMu.Lock()
-			delete(s.clients, conn)
-			s.clientsMu.Unlock()
-			_ = conn.Close()
-		}()
-		for {
-			if _, _, err := conn.ReadMessage(); err != nil {
-				break
-			}
-		}
+	s.mu.RLock()
+	if s.stopped {
+		s.mu.RUnlock()
+		c.close()
+		return
+	}
+	s.clientsMu.Lock()
+	s.clients[c] = true
+	s.clientsMu.Unlock()
+	s.wg.Add(2)
+	go s.readPump(c)
+	go s.writePump(c)
+	s.mu.RUnlock()
+}
+
+func (s *TelemetryServer) readPump(c *wsClient) {
+	defer s.wg.Done()
+	defer func() {
+		s.removeClient(c)
+		c.close()
 	}()
+	for {
+		if _, _, err := c.conn.ReadMessage(); err != nil {
+			return
+		}
+	}
+}
+
+func (s *TelemetryServer) writePump(c *wsClient) {
+	defer s.wg.Done()
+	defer func() {
+		s.removeClient(c)
+		c.close()
+	}()
+	for {
+		select {
+		case msg := <-c.send:
+			_ = c.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+			if err := c.conn.WriteMessage(websocket.TextMessage, msg); err != nil {
+				return
+			}
+		case <-c.done:
+			return
+		case <-s.stopChan:
+			return
+		}
+	}
 }
 
 func (s *TelemetryServer) listenBroadcast() {
+	defer s.wg.Done()
 	for {
 		select {
 		case msg, ok := <-s.broadcast:
@@ -123,14 +350,18 @@ func (s *TelemetryServer) listenBroadcast() {
 				return
 			}
 			s.clientsMu.Lock()
-			for client := range s.clients {
-				err := client.WriteMessage(websocket.TextMessage, msg)
-				if err != nil {
-					_ = client.Close()
-					delete(s.clients, client)
-				}
+			targets := make([]*wsClient, 0, len(s.clients))
+			for c := range s.clients {
+				targets = append(targets, c)
 			}
 			s.clientsMu.Unlock()
+
+			for _, c := range targets {
+				if !c.enqueue(msg) {
+					s.removeClient(c)
+					c.close()
+				}
+			}
 		case <-s.stopChan:
 			return
 		}
@@ -138,6 +369,7 @@ func (s *TelemetryServer) listenBroadcast() {
 }
 
 func (s *TelemetryServer) autoBroadcastLoop() {
+	defer s.wg.Done()
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
@@ -147,10 +379,7 @@ func (s *TelemetryServer) autoBroadcastLoop() {
 			data := GetDashboardTelemetry("")
 			b, err := json.Marshal(data)
 			if err == nil {
-				select {
-				case s.broadcast <- b:
-				default:
-				}
+				s.Broadcast(b)
 			}
 		case <-s.stopChan:
 			return
@@ -160,7 +389,7 @@ func (s *TelemetryServer) autoBroadcastLoop() {
 
 func (s *TelemetryServer) handleDashboardHTML(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Write([]byte(dashboardHTMLTemplate))
+	_, _ = w.Write([]byte(dashboardHTMLTemplate))
 }
 
 const dashboardHTMLTemplate = `<!DOCTYPE html>
@@ -196,9 +425,18 @@ const dashboardHTMLTemplate = `<!DOCTYPE html>
         .card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; border-bottom: 1px solid rgba(255,255,255,0.05); padding-bottom: 10px; }
         .card-title { font-size: 1.1rem; font-weight: 700; display: flex; align-items: center; gap: 8px; }
         .title-swarm { color: var(--mint); }
+        .title-sys { color: var(--pink); }
         .title-tokens { color: var(--gold); }
         .title-rag { color: var(--purple); }
         .title-sessions { color: var(--cyan); }
+
+        .spark-row { display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px; margin-top: 8px; }
+        .spark-box { background: rgba(15, 23, 42, 0.7); border: 1px solid rgba(255,255,255,0.06); border-radius: 8px; padding: 12px; }
+        .spark-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 8px; }
+        .spark-title { font-size: 0.8rem; color: var(--muted); text-transform: uppercase; font-weight: 700; }
+        .spark-val { font-size: 1.1rem; font-weight: 800; color: var(--cyan); }
+        .spark-svg { width: 100%; height: 48px; display: block; }
+        .spark-meta { font-size: 0.75rem; color: var(--muted); margin-top: 6px; font-family: monospace; }
         
         .meter-container { background: #0f172a; border-radius: 8px; height: 24px; width: 100%; overflow: hidden; margin: 12px 0; border: 1px solid var(--border); position: relative; }
         .meter-bar { height: 100%; background: linear-gradient(90deg, var(--mint), var(--gold)); width: 0%; transition: width 0.5s ease; }
@@ -240,6 +478,32 @@ const dashboardHTMLTemplate = `<!DOCTYPE html>
     </header>
 
     <div class="grid">
+        <!-- System CPU & RAM Sparklines Panel -->
+        <div class="card">
+            <div class="card-header">
+                <div class="card-title title-sys">💻 System CPU &amp; RAM Sparklines</div>
+                <span id="sys-summary" style="font-size:0.85rem; color:var(--muted)">0 samples</span>
+            </div>
+            <div class="spark-row">
+                <div class="spark-box">
+                    <div class="spark-head">
+                        <span class="spark-title">CPU Load</span>
+                        <span class="spark-val" id="cpu-pct">0.0%</span>
+                    </div>
+                    <svg class="spark-svg" id="cpu-sparkline-svg" viewBox="0 0 240 48" preserveAspectRatio="none"></svg>
+                    <div class="spark-meta" id="cpu-spark-txt">▁</div>
+                </div>
+                <div class="spark-box">
+                    <div class="spark-head">
+                        <span class="spark-title">RAM Usage</span>
+                        <span class="spark-val" id="ram-pct" style="color:var(--mint)">0.0%</span>
+                    </div>
+                    <svg class="spark-svg" id="ram-sparkline-svg" viewBox="0 0 240 48" preserveAspectRatio="none"></svg>
+                    <div class="spark-meta" id="ram-detail">0 B / 0 B</div>
+                </div>
+            </div>
+        </div>
+
         <!-- Subagent Swarm Panel -->
         <div class="card">
             <div class="card-header">
@@ -316,6 +580,49 @@ const dashboardHTMLTemplate = `<!DOCTYPE html>
     </div>
 
     <script>
+        function escapeHTML(str) {
+            return String(str == null ? '' : str)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+        }
+
+        function formatBytes(bytes) {
+            if (!bytes || bytes <= 0) return '0 B';
+            const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+            let idx = 0;
+            let val = bytes;
+            while (val >= 1024 && idx < units.length - 1) {
+                val /= 1024;
+                idx++;
+            }
+            return val.toFixed(1) + ' ' + units[idx];
+        }
+
+        function renderSparklineSVG(svgId, values, color) {
+            const svg = document.getElementById(svgId);
+            if (!svg) return;
+            if (!values || values.length === 0) {
+                svg.innerHTML = '';
+                return;
+            }
+            const w = 240, h = 48, pad = 3;
+            const n = values.length;
+            const pts = values.map((v, i) => {
+                const x = n === 1 ? w : (i * w) / (n - 1);
+                const clamped = Math.max(0, Math.min(100, Number(v) || 0));
+                const y = (h - pad) - (clamped / 100) * (h - 2 * pad);
+                return x.toFixed(1) + ',' + y.toFixed(1);
+            });
+            const polyline = pts.join(' ');
+            const area = '0,' + h + ' ' + polyline + ' ' + w + ',' + h;
+            svg.innerHTML =
+                '<polygon fill="' + color + '" fill-opacity="0.16" points="' + area + '"></polygon>' +
+                '<polyline fill="none" stroke="' + color + '" stroke-width="2" stroke-linejoin="round" points="' + polyline + '"></polyline>';
+        }
+
         async function fetchTelemetry() {
             try {
                 const res = await fetch('/api/telemetry');
@@ -327,9 +634,22 @@ const dashboardHTMLTemplate = `<!DOCTYPE html>
         }
 
         function renderTelemetry(data) {
+            // 0. System CPU & RAM Sparklines Panel
+            const sys = data.system_metrics || {};
+            const cpuHist = sys.cpu_history || [];
+            const ramHist = sys.ram_history || [];
+            document.getElementById('sys-summary').innerText = cpuHist.length + ' Samples';
+            document.getElementById('cpu-pct').innerText = (Number(sys.cpu_percent) || 0).toFixed(1) + '%';
+            document.getElementById('ram-pct').innerText = (Number(sys.ram_percent) || 0).toFixed(1) + '%';
+            document.getElementById('cpu-spark-txt').innerText = sys.cpu_sparkline || '▁';
+            document.getElementById('ram-detail').innerText = formatBytes(sys.ram_used_bytes) + ' / ' + formatBytes(sys.ram_total_bytes);
+            renderSparklineSVG('cpu-sparkline-svg', cpuHist, '#38bdf8');
+            renderSparklineSVG('ram-sparkline-svg', ramHist, '#34d399');
+
             // 1. Swarm Panel
-            const swarm = data.subagents;
-            document.getElementById('swarm-summary').innerText = swarm.active_count + ' Active | ' + swarm.completed_count + ' Done';
+            const swarm = data.subagents || { active_count: 0, completed_count: 0, failed_count: 0, subagents: [] };
+            document.getElementById('swarm-summary').innerText =
+                swarm.active_count + ' Active | ' + swarm.completed_count + ' Done | ' + (swarm.failed_count || 0) + ' Failed';
             const tbody = document.getElementById('swarm-tbody');
             if (!swarm.subagents || swarm.subagents.length === 0) {
                 tbody.innerHTML = '<tr><td colspan="5" style="color:var(--muted)">No active subagents</td></tr>';
@@ -337,15 +657,16 @@ const dashboardHTMLTemplate = `<!DOCTYPE html>
                 let html = '';
                 for (let i = 0; i < swarm.subagents.length; i++) {
                     const s = swarm.subagents[i];
+                    const statusLabel = s.status || (s.state ? String(s.state).toUpperCase() : 'UNKNOWN');
                     let pillClass = 'status-running';
-                    if (s.status === 'COMPLETED') pillClass = 'status-completed';
-                    if (s.status === 'FAILED' || s.status === 'KILLED') pillClass = 'status-failed';
+                    if (statusLabel === 'COMPLETED') pillClass = 'status-completed';
+                    if (statusLabel === 'FAILED' || statusLabel === 'KILLED' || statusLabel === 'ERRORED') pillClass = 'status-failed';
                     html += '<tr>' +
-                        '<td><strong>' + s.id + '</strong></td>' +
-                        '<td>' + s.role + '</td>' +
-                        '<td><span class="status-pill ' + pillClass + '">' + s.status + '</span></td>' +
-                        '<td>' + s.model + '</td>' +
-                        '<td>' + s.workspace + '</td>' +
+                        '<td><strong>' + escapeHTML(s.id) + '</strong></td>' +
+                        '<td>' + escapeHTML(s.role) + '</td>' +
+                        '<td><span class="status-pill ' + pillClass + '">' + escapeHTML(statusLabel) + '</span></td>' +
+                        '<td>' + escapeHTML(s.model) + '</td>' +
+                        '<td>' + escapeHTML(s.workspace) + '</td>' +
                     '</tr>';
                 }
                 tbody.innerHTML = html;
@@ -366,7 +687,7 @@ const dashboardHTMLTemplate = `<!DOCTYPE html>
             renderRAGResults(rag.query_results);
 
             // 4. Session Transcripts Panel
-            const trans = data.session_transcripts;
+            const trans = data.session_transcripts || [];
             document.getElementById('session-count').innerText = trans.length + ' Active Session Logs';
             const tList = document.getElementById('transcript-list');
             let tHtml = '';
@@ -375,8 +696,8 @@ const dashboardHTMLTemplate = `<!DOCTYPE html>
                 const date = new Date(tr.timestamp);
                 const timeStr = date.toLocaleTimeString();
                 tHtml += '<div class="transcript-item">' +
-                    '<span class="ts-time">[' + timeStr + ']</span> <span class="ts-sender">' + tr.sender + '</span> (' + tr.session_name + ')' +
-                    '<div class="ts-msg">' + tr.snippet + '</div>' +
+                    '<span class="ts-time">[' + escapeHTML(timeStr) + ']</span> <span class="ts-sender">' + escapeHTML(tr.sender) + '</span> (' + escapeHTML(tr.session_name) + ')' +
+                    '<div class="ts-msg">' + escapeHTML(tr.snippet) + '</div>' +
                 '</div>';
             }
             tList.innerHTML = tHtml;
@@ -403,8 +724,8 @@ const dashboardHTMLTemplate = `<!DOCTYPE html>
             for (let i = 0; i < results.length; i++) {
                 const r = results[i];
                 html += '<div class="rag-item">' +
-                    '<div class="rag-id">' + r.ID + ' <span class="rag-score">' + (r.Score * 100).toFixed(1) + '% Match</span></div>' +
-                    '<div class="rag-text">' + r.Text + '</div>' +
+                    '<div class="rag-id">' + escapeHTML(r.ID) + ' <span class="rag-score">' + (r.Score * 100).toFixed(1) + '% Match</span></div>' +
+                    '<div class="rag-text">' + escapeHTML(r.Text) + '</div>' +
                 '</div>';
             }
             container.innerHTML = html;
@@ -414,7 +735,8 @@ const dashboardHTMLTemplate = `<!DOCTYPE html>
         setInterval(fetchTelemetry, 2000);
 
         try {
-            const ws = new WebSocket('ws://' + window.location.host + '/ws');
+            const wsProto = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
+            const ws = new WebSocket(wsProto + window.location.host + '/ws');
             ws.onmessage = function(evt) {
                 try {
                     const data = JSON.parse(evt.data);

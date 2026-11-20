@@ -3,9 +3,15 @@ package agentui
 import (
 	"context"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
+	"runtime"
+	"runtime/metrics"
+	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
@@ -15,6 +21,7 @@ import (
 	"github.com/CmfH009/microgravity/internal/sessions"
 	"github.com/CmfH009/microgravity/internal/subagent"
 	"github.com/CmfH009/microgravity/internal/ui"
+	"github.com/shirou/gopsutil/v3/mem"
 )
 
 // TokenUsageStats holds LLM token usage and budget metrics.
@@ -59,14 +66,217 @@ type SubagentSwarmTelemetry struct {
 	Subagents      []*subagent.SubagentInfo `json:"subagents"`
 }
 
-// DashboardTelemetry is a full snapshot of all 4 telemetry categories.
+// SystemMetricsTelemetry holds current host CPU/RAM usage and bounded sample history for sparklines.
+type SystemMetricsTelemetry struct {
+	CPUPercent    float64   `json:"cpu_percent"`
+	RAMPercent    float64   `json:"ram_percent"`
+	RAMUsedBytes  uint64    `json:"ram_used_bytes"`
+	RAMTotalBytes uint64    `json:"ram_total_bytes"`
+	CPUHistory    []float64 `json:"cpu_history"`
+	RAMHistory    []float64 `json:"ram_history"`
+	CPUSparkline  string    `json:"cpu_sparkline"`
+	RAMSparkline  string    `json:"ram_sparkline"`
+}
+
+// DashboardTelemetry is a full snapshot of all telemetry categories.
 type DashboardTelemetry struct {
 	Timestamp          time.Time              `json:"timestamp"`
 	MCPServers         []string               `json:"mcp_servers"`
 	Subagents          SubagentSwarmTelemetry `json:"subagents"`
+	SystemMetrics      SystemMetricsTelemetry `json:"system_metrics"`
 	TokenUsage         TokenUsageStats        `json:"token_usage"`
 	RAGMemory          RAGInspectionData      `json:"rag_memory"`
 	SessionTranscripts []TranscriptLogEntry   `json:"session_transcripts"`
+}
+
+const maxMetricHistorySamples = 30
+
+type procCPUStat struct {
+	busy  uint64
+	total uint64
+}
+
+type runtimeCPUSample struct {
+	busy  float64
+	total float64
+}
+
+var (
+	metricsMu      sync.Mutex
+	cpuHistory     []float64
+	ramHistory     []float64
+	prevProcCPU    procCPUStat
+	hasPrevProcCPU bool
+	prevRTCPU      runtimeCPUSample
+	hasPrevRTCPU   bool
+)
+
+func readLinuxProcStatCPU() (procCPUStat, bool) {
+	data, err := os.ReadFile("/proc/stat")
+	if err != nil {
+		return procCPUStat{}, false
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if !strings.HasPrefix(line, "cpu ") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 5 {
+			return procCPUStat{}, false
+		}
+		var vals [8]uint64
+		for i := 1; i < len(fields) && i <= 8; i++ {
+			v, parseErr := strconv.ParseUint(fields[i], 10, 64)
+			if parseErr != nil {
+				return procCPUStat{}, false
+			}
+			vals[i-1] = v
+		}
+		// fields: user(0) nice(1) system(2) idle(3) iowait(4) irq(5) softirq(6) steal(7)
+		idle := vals[3] + vals[4]
+		busy := vals[0] + vals[1] + vals[2] + vals[5] + vals[6] + vals[7]
+		return procCPUStat{busy: busy, total: busy + idle}, true
+	}
+	return procCPUStat{}, false
+}
+
+func sampleCPUPercentLocked() float64 {
+	if runtime.GOOS == "linux" {
+		if st, ok := readLinuxProcStatCPU(); ok {
+			if hasPrevProcCPU && st.total > prevProcCPU.total {
+				dBusy := st.busy - prevProcCPU.busy
+				dTotal := st.total - prevProcCPU.total
+				prevProcCPU = st
+				return clampPercent((float64(dBusy) / float64(dTotal)) * 100.0)
+			}
+			prevProcCPU = st
+			hasPrevProcCPU = true
+			if st.total > 0 {
+				return clampPercent((float64(st.busy) / float64(st.total)) * 100.0)
+			}
+		}
+	}
+
+	samples := []metrics.Sample{
+		{Name: "/cpu/classes/total:cpu-seconds"},
+		{Name: "/cpu/classes/idle:cpu-seconds"},
+	}
+	metrics.Read(samples)
+	if samples[0].Value.Kind() == metrics.KindFloat64 && samples[1].Value.Kind() == metrics.KindFloat64 {
+		total := samples[0].Value.Float64()
+		idle := samples[1].Value.Float64()
+		busy := total - idle
+		if busy < 0 {
+			busy = 0
+		}
+		if hasPrevRTCPU && total > prevRTCPU.total {
+			dTotal := total - prevRTCPU.total
+			dBusy := busy - prevRTCPU.busy
+			if dBusy < 0 {
+				dBusy = 0
+			}
+			prevRTCPU = runtimeCPUSample{busy: busy, total: total}
+			return clampPercent((dBusy / dTotal) * 100.0)
+		}
+		prevRTCPU = runtimeCPUSample{busy: busy, total: total}
+		hasPrevRTCPU = true
+		if total > 0 {
+			return clampPercent((busy / total) * 100.0)
+		}
+	}
+
+	if len(cpuHistory) > 0 {
+		return cpuHistory[len(cpuHistory)-1]
+	}
+	return 0
+}
+
+func clampPercent(v float64) float64 {
+	if math.IsNaN(v) || math.IsInf(v, 0) || v < 0 {
+		return 0
+	}
+	if v > 100 {
+		return 100
+	}
+	return math.Round(v*10) / 10
+}
+
+func appendMetricSample(history []float64, val float64) []float64 {
+	if len(history) >= maxMetricHistorySamples {
+		copy(history, history[1:])
+		history[len(history)-1] = val
+		return history
+	}
+	return append(history, val)
+}
+
+// RenderPlainSparkline renders a slice of percentage values (0-100) using Unicode block characters.
+func RenderPlainSparkline(values []float64) string {
+	if len(values) == 0 {
+		return ""
+	}
+	blocks := []rune("▁▂▃▄▅▆▇█")
+	var sb strings.Builder
+	sb.Grow(len(values))
+	for _, v := range values {
+		clamped := clampPercent(v)
+		idx := int(math.Round((clamped / 100.0) * float64(len(blocks)-1)))
+		if idx < 0 {
+			idx = 0
+		}
+		if idx >= len(blocks) {
+			idx = len(blocks) - 1
+		}
+		sb.WriteRune(blocks[idx])
+	}
+	return sb.String()
+}
+
+// FloatHistoryToInts converts percentage float samples to rounded 0-100 integer slices for ui.Sparkline.
+func FloatHistoryToInts(values []float64) []int {
+	if len(values) == 0 {
+		return nil
+	}
+	out := make([]int, len(values))
+	for i, v := range values {
+		out[i] = int(math.Round(clampPercent(v)))
+	}
+	return out
+}
+
+// CollectSystemMetrics samples current CPU and RAM utilization and appends to bounded history.
+func CollectSystemMetrics() SystemMetricsTelemetry {
+	metricsMu.Lock()
+	defer metricsMu.Unlock()
+
+	cpuPct := sampleCPUPercentLocked()
+
+	var ramPct float64
+	var ramUsed, ramTotal uint64
+	if vm, err := mem.VirtualMemory(); err == nil && vm != nil {
+		ramPct = clampPercent(vm.UsedPercent)
+		ramUsed = vm.Used
+		ramTotal = vm.Total
+	}
+
+	cpuHistory = appendMetricSample(cpuHistory, cpuPct)
+	ramHistory = appendMetricSample(ramHistory, ramPct)
+
+	cpuCopy := make([]float64, len(cpuHistory))
+	copy(cpuCopy, cpuHistory)
+	ramCopy := make([]float64, len(ramHistory))
+	copy(ramCopy, ramHistory)
+
+	return SystemMetricsTelemetry{
+		CPUPercent:    cpuPct,
+		RAMPercent:    ramPct,
+		RAMUsedBytes:  ramUsed,
+		RAMTotalBytes: ramTotal,
+		CPUHistory:    cpuCopy,
+		RAMHistory:    ramCopy,
+		CPUSparkline:  RenderPlainSparkline(cpuCopy),
+		RAMSparkline:  RenderPlainSparkline(ramCopy),
+	}
 }
 
 // RecordTokenUsage accumulates token metrics for model execution.
@@ -112,40 +322,83 @@ func GetTokenStats() TokenUsageStats {
 	}
 }
 
-// GetDashboardTelemetry collects live telemetry across subagents, tokens, RAG, and sessions.
+func isSubagentActive(s *subagent.SubagentInfo) bool {
+	if s == nil {
+		return false
+	}
+	if s.Status == "RUNNING" {
+		return true
+	}
+	switch s.State {
+	case subagent.StateRunning, subagent.StateIdle,
+		subagent.StateWaitingForInput, subagent.StateWaitingForDeps,
+		subagent.StateWaitingForMessage:
+		return true
+	default:
+		return false
+	}
+}
+
+// GetDashboardTelemetry collects live telemetry across subagents, system metrics, tokens, RAG, and sessions.
 func GetDashboardTelemetry(queryPrompt string) DashboardTelemetry {
 	servers := config.GetMCPServers()
 
 	// 1. Subagent Swarm
 	mgr := subagent.GetManager()
 	subs := mgr.List()
+	if subs == nil {
+		subs = []*subagent.SubagentInfo{}
+	}
+	sort.Slice(subs, func(i, j int) bool {
+		ri := isSubagentActive(subs[i])
+		rj := isSubagentActive(subs[j])
+		if ri != rj {
+			return ri
+		}
+		if subs[i] != nil && subs[j] != nil {
+			if !subs[i].StartTime.Equal(subs[j].StartTime) {
+				return subs[i].StartTime.After(subs[j].StartTime)
+			}
+			return subs[i].ID < subs[j].ID
+		}
+		return false
+	})
+
 	swarmTel := SubagentSwarmTelemetry{
 		Subagents: subs,
 	}
 	for _, s := range subs {
-		switch s.Status {
-		case "RUNNING":
+		if s == nil {
+			continue
+		}
+		switch {
+		case isSubagentActive(s):
 			swarmTel.ActiveCount++
-		case "COMPLETED":
+		case s.Status == "COMPLETED" || s.State == subagent.StateCompleted:
 			swarmTel.CompletedCount++
-		case "FAILED", "KILLED":
+		case s.Status == "FAILED" || s.Status == "KILLED" ||
+			s.State == subagent.StateErrored || s.State == subagent.StateKilled:
 			swarmTel.FailedCount++
 		}
 	}
 
-	// 2. Token Usage
+	// 2. System CPU/RAM Metrics & Sparkline History
+	sysMetrics := CollectSystemMetrics()
+
+	// 3. Token Usage
 	tokenStats := GetTokenStats()
 
-	// 3. RAG Memory
+	// 4. RAG Memory
 	ragData := GetRAGTelemetry(queryPrompt)
 
-	// 4. Session Transcripts
+	// 5. Session Transcripts
 	transcripts := GetSessionTranscriptsTelemetry()
 
 	return DashboardTelemetry{
 		Timestamp:          time.Now(),
 		MCPServers:         servers,
 		Subagents:          swarmTel,
+		SystemMetrics:      sysMetrics,
 		TokenUsage:         tokenStats,
 		RAGMemory:          ragData,
 		SessionTranscripts: transcripts,
@@ -255,6 +508,39 @@ func GetSessionTranscriptsTelemetry() []TranscriptLogEntry {
 	return entries
 }
 
+// RenderSystemMetricsPanel renders CPU/RAM sparkline history and resource utilization.
+func RenderSystemMetricsPanel(metrics SystemMetricsTelemetry) string {
+	panel := ui.NewPanel("💻 System CPU & RAM Sparklines")
+	panel.TitleRole = ui.RolePrimary
+	panel.BorderRole = ui.RolePrimary
+
+	cpuInts := FloatHistoryToInts(metrics.CPUHistory)
+	if len(cpuInts) == 0 {
+		cpuInts = []int{int(math.Round(clampPercent(metrics.CPUPercent)))}
+	}
+	ramInts := FloatHistoryToInts(metrics.RAMHistory)
+	if len(ramInts) == 0 {
+		ramInts = []int{int(math.Round(clampPercent(metrics.RAMPercent)))}
+	}
+
+	var usedBytes, totalBytes int64
+	if metrics.RAMUsedBytes <= math.MaxInt64 {
+		usedBytes = int64(metrics.RAMUsedBytes)
+	}
+	if metrics.RAMTotalBytes <= math.MaxInt64 {
+		totalBytes = int64(metrics.RAMTotalBytes)
+	}
+
+	cpuLabel := fmt.Sprintf("CPU Load (%.1f%% | samples: %d)", metrics.CPUPercent, len(metrics.CPUHistory))
+	ramLabel := fmt.Sprintf("RAM Usage (%.1f%% | %s / %s)", metrics.RAMPercent, ui.HumanBytes(usedBytes), ui.HumanBytes(totalBytes))
+
+	cpuSpark := ui.SparklineStat(cpuLabel, cpuInts, ui.RolePrimary)
+	ramSpark := ui.SparklineStat(ramLabel, ramInts, ui.RoleSuccess)
+
+	panel.Content = cpuSpark + "\n\n" + ramSpark
+	return panel.Render()
+}
+
 // RenderSubagentSwarmPanel renders visual panel for live subagent swarm tracking.
 func RenderSubagentSwarmPanel(swarm SubagentSwarmTelemetry) string {
 	panel := ui.NewPanel("🐝 Live Subagent Swarm Tracking")
@@ -270,13 +556,28 @@ func RenderSubagentSwarmPanel(swarm SubagentSwarmTelemetry) string {
 		sb.WriteString(ui.SystemInfoStyle.Render("No active subagent threads running"))
 	} else {
 		for _, s := range swarm.Subagents {
+			if s == nil {
+				continue
+			}
+			status := s.Status
+			if status == "" && s.State != "" {
+				status = strings.ToUpper(string(s.State))
+			}
 			badge := "🟢"
-			if s.Status == "COMPLETED" {
+			if status == "COMPLETED" || s.State == subagent.StateCompleted {
 				badge = "🏁"
-			} else if s.Status == "FAILED" || s.Status == "KILLED" {
+			} else if status == "FAILED" || status == "KILLED" || s.State == subagent.StateErrored || s.State == subagent.StateKilled {
 				badge = "🔴"
 			}
-			sb.WriteString(fmt.Sprintf("%s [%s] %s (%s)\n  Model: %s | Mode: %s\n", badge, s.ID, s.Role, s.Status, s.Model, s.Workspace))
+			line := fmt.Sprintf("%s [%s] %s (%s)\n  Model: %s | Mode: %s", badge, s.ID, s.Role, status, s.Model, s.Workspace)
+			if s.StateDetail != "" {
+				detail := s.StateDetail
+				if len(detail) > 64 {
+					detail = detail[:61] + "..."
+				}
+				line += fmt.Sprintf(" | %s", detail)
+			}
+			sb.WriteString(line + "\n")
 		}
 	}
 
@@ -306,9 +607,14 @@ func RenderTokenUsagePanel(stats TokenUsageStats) string {
 		stats.ContextWindow, stats.PromptTokens, stats.CompletionTokens, stats.TotalTokens, stats.UtilizationPct, meter, stats.TokensRemaining, stats.CostEstimate,
 	)
 
+	modelKeys := make([]string, 0, len(stats.ModelBreakdown))
+	for model := range stats.ModelBreakdown {
+		modelKeys = append(modelKeys, model)
+	}
+	sort.Strings(modelKeys)
 	modelsText := " Model Distribution: "
-	for model, count := range stats.ModelBreakdown {
-		modelsText += fmt.Sprintf("[%s: %d] ", model, count)
+	for _, model := range modelKeys {
+		modelsText += fmt.Sprintf("[%s: %d] ", model, stats.ModelBreakdown[model])
 	}
 
 	panel.Content = statsText + lipgloss.NewStyle().Foreground(ui.RoleColor(ui.RoleTextMuted)).Render(modelsText)
@@ -385,13 +691,16 @@ func RenderFullDashboard(telemetry DashboardTelemetry) string {
 
 	topRow := lipgloss.JoinHorizontal(lipgloss.Top, mcpCard, "  ", swarmCard)
 
-	// Section 3: Token Usage Card
+	// Section 3: System CPU & RAM Sparklines Card
+	sysCard := RenderSystemMetricsPanel(telemetry.SystemMetrics)
+
+	// Section 4: Token Usage Card
 	tokenCard := RenderTokenUsagePanel(telemetry.TokenUsage)
 
-	// Section 4: RAG Memory Inspection Card
+	// Section 5: RAG Memory Inspection Card
 	ragCard := RenderRAGMemoryPanel(telemetry.RAGMemory)
 
-	// Section 5: Session Transcript Logs Card
+	// Section 6: Session Transcript Logs Card
 	transcriptCard := RenderSessionTranscriptsPanel(telemetry.SessionTranscripts)
 
 	finalView := lipgloss.JoinVertical(
@@ -399,6 +708,8 @@ func RenderFullDashboard(telemetry DashboardTelemetry) string {
 		header,
 		"\n",
 		topRow,
+		"\n",
+		sysCard,
 		"\n",
 		tokenCard,
 		"\n",
