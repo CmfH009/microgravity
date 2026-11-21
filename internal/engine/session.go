@@ -97,6 +97,8 @@ type SessionConfig struct {
 	OpenAIModel      string
 	CoreMemory       string
 	MemoryStore      *memory.MemoryStore
+	Router           *router.Router
+	Providers        router.Providers
 }
 
 // AsyncEvent represents an asynchronous alert from subagents, background tasks, or schedulers.
@@ -182,14 +184,36 @@ func NewSession(cfg SessionConfig) (*Session, error) {
 
 	trajLogger, _ := trajectory.NewLogger(cfg.SessionName)
 
+	ollamaClient := ollama.NewClient(cfg.OllamaBaseURL)
+	openAIClient := openai.NewClient(cfg.OpenAIBaseURL, cfg.OpenAIAPIKey)
+	cloudClient := cloud.NewClient()
+
+	providers := cfg.Providers
+	if providers.Ollama == nil {
+		providers.Ollama = ollamaClient
+	}
+	if providers.OpenAI == nil {
+		providers.OpenAI = openAIClient
+	}
+	if providers.Cloud == nil {
+		providers.Cloud = cloudClient
+	}
+
+	routerInst := cfg.Router
+	if routerInst == nil {
+		routerInst = router.NewWithProviders(providers)
+	} else if routerInst.GetProviders() == (router.Providers{}) {
+		routerInst.SetProviders(providers)
+	}
+
 	s := &Session{
 		Config:        cfg,
 		State:         StateIdle,
 		TrajLogger:    trajLogger,
-		OllamaClient:  ollama.NewClient(cfg.OllamaBaseURL),
-		OpenAIClient:  openai.NewClient(cfg.OpenAIBaseURL, cfg.OpenAIAPIKey),
-		CloudClient:   cloud.NewClient(),
-		Router:        router.NewRouter(),
+		OllamaClient:  ollamaClient,
+		OpenAIClient:  openAIClient,
+		CloudClient:   cloudClient,
+		Router:        routerInst,
 		closeCh:       make(chan struct{}),
 		CheckpointMgr: git.NewCheckpointManager(cfg.Cwd, cfg.SessionName),
 		Verifier:      verifier.New(),
@@ -327,6 +351,59 @@ func (s *Session) GetRoutingMode() router.RoutingMode {
 		return router.ModeHybrid
 	}
 	return router.NormalizeRoutingMode(raw)
+}
+
+func (s *Session) routePolicyLocked() router.RoutePolicy {
+	var mode router.RoutingMode
+	if strings.TrimSpace(s.Config.RoutingMode) != "" {
+		mode = router.NormalizeRoutingMode(s.Config.RoutingMode)
+	} else if envMode, ok := router.RoutingModeFromEnv(); ok {
+		mode = envMode
+	} else {
+		mode = router.ModeHybrid
+	}
+	localModel := s.Config.LocalModelName
+	if localModel == "" {
+		localModel = router.DefaultLocalModel
+	}
+	cloudModel := s.Config.CloudModelName
+	if cloudModel == "" {
+		cloudModel = router.DefaultCloudModel
+	}
+	activeModel := s.Config.ActiveModel
+	if activeModel == "" {
+		activeModel = cloudModel
+	}
+	return router.RoutePolicy{
+		RoutingMode:      mode,
+		ExplicitProvider: s.Config.ExplicitProvider,
+		ActiveModel:      activeModel,
+		LocalModel:       localModel,
+		LocalFastModel:   s.Config.LocalFastModel,
+		LocalHeavyModel:  s.Config.LocalHeavyModel,
+		CloudModel:       cloudModel,
+		OpenAIBaseURL:    s.Config.OpenAIBaseURL,
+		OpenAIModel:      s.Config.OpenAIModel,
+	}
+}
+
+// RoutePolicy returns a thread-safe snapshot of the session's active routing policy.
+func (s *Session) RoutePolicy() router.RoutePolicy {
+	if s == nil {
+		return router.RoutePolicy{RoutingMode: router.ModeHybrid}
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.routePolicyLocked()
+}
+
+// IsLocalRoute reports whether the session currently routes primarily to a local inference backend.
+func (s *Session) IsLocalRoute() bool {
+	if s == nil {
+		return false
+	}
+	p := s.RoutePolicy()
+	return router.IsLocalRoute(p.ExplicitProvider, string(p.RoutingMode), p.OpenAIBaseURL, p.ActiveModel, p.LocalModel)
 }
 
 func cloneMessage(m Message) Message {

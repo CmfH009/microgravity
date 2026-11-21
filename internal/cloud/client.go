@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
-	"net"
 	"net/http"
 	"os"
 	"strconv"
@@ -20,12 +19,14 @@ import (
 	"github.com/CmfH009/microgravity/internal/budget"
 	"github.com/CmfH009/microgravity/internal/cmdparse"
 	"github.com/CmfH009/microgravity/internal/config"
+	"github.com/CmfH009/microgravity/internal/httputil"
 	"github.com/CmfH009/microgravity/internal/mcp"
+	"github.com/CmfH009/microgravity/internal/router"
 )
 
 const (
 	defaultBaseURL    = "https://generativelanguage.googleapis.com"
-	maxErrorBodyBytes = 64 * 1024
+	maxErrorBodyBytes = httputil.MaxErrorBodyBytes
 )
 
 var (
@@ -43,27 +44,18 @@ type Client struct {
 	VertexCreds *authutil.VertexCredentials
 }
 
-func NewClient() *Client {
-	transport := &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
-		DialContext: (&net.Dialer{
-			Timeout:   15 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
-		TLSHandshakeTimeout:   15 * time.Second,
-		ResponseHeaderTimeout: 30 * time.Second,
-		IdleConnTimeout:       90 * time.Second,
-		MaxIdleConns:          100,
-		MaxIdleConnsPerHost:   10,
-		ExpectContinueTimeout: 1 * time.Second,
-	}
+var _ router.Provider = (*Client)(nil)
 
+func NewClient() *Client {
 	return &Client{
-		BaseURL: "https://generativelanguage.googleapis.com",
-		HTTPClient: &http.Client{
-			Transport: transport,
-			Timeout:   10 * time.Minute,
-		},
+		BaseURL: defaultBaseURL,
+		HTTPClient: httputil.NewClient(httputil.ClientConfig{
+			TLSHandshakeTimeout:   15 * time.Second,
+			ResponseHeaderTimeout: 30 * time.Second,
+			MaxIdleConns:          100,
+			MaxIdleConnsPerHost:   10,
+			ExpectContinueTimeout: 1 * time.Second,
+		}),
 	}
 }
 
@@ -156,14 +148,11 @@ type GenerateResponse struct {
 	Error         *APIError      `json:"error,omitempty"`
 }
 
-type GenerateResult struct {
-	Text      string
-	ToolCalls []cmdparse.ToolCall
-}
+type GenerateResult = router.GenerateResult
 
 // estimateTokens approximates token count from text length (~4 chars/token).
 func estimateTokens(s string) int {
-	return (len(s) + 3) / 4
+	return httputil.EstimateTokens(s)
 }
 
 // MCPToGeminiTools converts MCP tool definitions to Gemini API function declarations.
@@ -366,21 +355,11 @@ func (c *Client) baseURL() string {
 }
 
 func drainAndClose(body io.ReadCloser) {
-	if body == nil {
-		return
-	}
-	_, _ = io.Copy(io.Discard, io.LimitReader(body, maxErrorBodyBytes))
-	_ = body.Close()
+	httputil.DrainAndClose(body)
 }
 
 func readBoundedErrorBody(body io.ReadCloser) string {
-	if body == nil {
-		return ""
-	}
-	data, _ := io.ReadAll(io.LimitReader(body, maxErrorBodyBytes))
-	_, _ = io.Copy(io.Discard, io.LimitReader(body, maxErrorBodyBytes))
-	_ = body.Close()
-	return strings.TrimSpace(string(data))
+	return httputil.ReadBoundedErrorBody(body)
 }
 
 func isQuotaBody(body string) bool {

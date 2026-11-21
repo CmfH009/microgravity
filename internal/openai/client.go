@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"sort"
 	"strings"
@@ -16,12 +15,14 @@ import (
 
 	"github.com/CmfH009/microgravity/internal/budget"
 	"github.com/CmfH009/microgravity/internal/cmdparse"
+	"github.com/CmfH009/microgravity/internal/httputil"
 	"github.com/CmfH009/microgravity/internal/mcp"
+	"github.com/CmfH009/microgravity/internal/router"
 )
 
 const (
 	defaultBaseURL    = "http://localhost:11434/v1"
-	maxErrorBodyBytes = 64 * 1024
+	maxErrorBodyBytes = httputil.MaxErrorBodyBytes
 )
 
 var (
@@ -39,22 +40,12 @@ type Client struct {
 	HTTPClient *http.Client
 }
 
+var _ router.Provider = (*Client)(nil)
+
 func newDefaultHTTPClient() *http.Client {
-	transport := &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
-		DialContext: (&net.Dialer{
-			Timeout:   15 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
+	return httputil.NewClient(httputil.ClientConfig{
 		ResponseHeaderTimeout: 45 * time.Second,
-		IdleConnTimeout:       90 * time.Second,
-		MaxIdleConns:          32,
-		MaxIdleConnsPerHost:   8,
-	}
-	return &http.Client{
-		Transport: transport,
-		Timeout:   10 * time.Minute,
-	}
+	})
 }
 
 // NewClient creates an OpenAI-compatible client targeting baseURL (defaults to http://localhost:11434/v1).
@@ -93,25 +84,15 @@ func (c *Client) endpointURL(path string) string {
 }
 
 func drainAndClose(body io.ReadCloser) {
-	if body == nil {
-		return
-	}
-	_, _ = io.Copy(io.Discard, io.LimitReader(body, maxErrorBodyBytes))
-	_ = body.Close()
+	httputil.DrainAndClose(body)
 }
 
 func readBoundedErrorBody(body io.ReadCloser) string {
-	if body == nil {
-		return ""
-	}
-	data, _ := io.ReadAll(io.LimitReader(body, maxErrorBodyBytes))
-	_, _ = io.Copy(io.Discard, io.LimitReader(body, maxErrorBodyBytes))
-	_ = body.Close()
-	return strings.TrimSpace(string(data))
+	return httputil.ReadBoundedErrorBody(body)
 }
 
 func estimateTokens(s string) int {
-	return (len(s) + 3) / 4
+	return httputil.EstimateTokens(s)
 }
 
 // Tool describes a function tool definition in the OpenAI chat completions schema.
@@ -142,10 +123,7 @@ type ChatCompletionRequest struct {
 }
 
 // GenerateResult holds the accumulated text and parsed tool calls from a completion.
-type GenerateResult struct {
-	Text      string
-	ToolCalls []cmdparse.ToolCall
-}
+type GenerateResult = router.GenerateResult
 
 // APIError captures an error object embedded inside an OpenAI-compatible HTTP/SSE payload.
 type APIError struct {

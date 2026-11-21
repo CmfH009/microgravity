@@ -64,48 +64,29 @@ func BuildEngineSession(ctx context.Context, opts SessionOptions) (*engine.Sessi
 	}
 
 	cfgDisk, _ := config.LoadConfig()
-	if strings.TrimSpace(opts.RoutingMode) == "" {
-		if envMode, ok := router.RoutingModeFromEnv(); ok {
-			opts.RoutingMode = string(envMode)
-		} else if cfgDisk != nil && strings.TrimSpace(cfgDisk.RoutingMode) != "" {
-			opts.RoutingMode = string(router.NormalizeRoutingMode(cfgDisk.RoutingMode))
-		} else {
-			opts.RoutingMode = string(router.ModeHybrid)
-		}
-	} else {
-		opts.RoutingMode = string(router.NormalizeRoutingMode(opts.RoutingMode))
-	}
-	if strings.TrimSpace(opts.LocalFastModel) == "" {
-		if envFast := strings.TrimSpace(os.Getenv("MG_LOCAL_FAST_MODEL")); envFast != "" {
-			opts.LocalFastModel = envFast
-		} else if cfgDisk != nil && strings.TrimSpace(cfgDisk.LocalFastModel) != "" {
-			opts.LocalFastModel = strings.TrimSpace(cfgDisk.LocalFastModel)
-		}
-	}
-	if strings.TrimSpace(opts.LocalHeavyModel) == "" {
-		if envHeavy := strings.TrimSpace(os.Getenv("MG_LOCAL_HEAVY_MODEL")); envHeavy != "" {
-			opts.LocalHeavyModel = envHeavy
-		} else if cfgDisk != nil && strings.TrimSpace(cfgDisk.LocalHeavyModel) != "" {
-			opts.LocalHeavyModel = strings.TrimSpace(cfgDisk.LocalHeavyModel)
-		}
-	}
-	if strings.TrimSpace(opts.OpenAIBaseURL) == "" {
-		if envURL := strings.TrimSpace(os.Getenv("MG_OPENAI_BASE_URL")); envURL != "" {
-			opts.OpenAIBaseURL = envURL
-		} else if cfgDisk != nil && strings.TrimSpace(cfgDisk.OpenAIBaseURL) != "" {
-			opts.OpenAIBaseURL = strings.TrimSpace(cfgDisk.OpenAIBaseURL)
-		}
-	}
-	if strings.TrimSpace(opts.OpenAIAPIKey) == "" {
-		if envKey := strings.TrimSpace(os.Getenv("MG_OPENAI_API_KEY")); envKey != "" {
-			opts.OpenAIAPIKey = envKey
-		} else if cfgDisk != nil && strings.TrimSpace(cfgDisk.OpenAIAPIKey) != "" {
-			opts.OpenAIAPIKey = strings.TrimSpace(cfgDisk.OpenAIAPIKey)
-		}
-	}
-	if strings.TrimSpace(opts.OpenAIModel) == "" && cfgDisk != nil && strings.TrimSpace(cfgDisk.OpenAIModel) != "" {
-		opts.OpenAIModel = strings.TrimSpace(cfgDisk.OpenAIModel)
-	}
+	resolved := router.ResolveConfig(router.ConfigInput{
+		Config:           cfgDisk,
+		RoutingMode:      opts.RoutingMode,
+		ActiveModel:      opts.ActiveModel,
+		LocalModel:       opts.LocalModelName,
+		CloudModel:       opts.CloudModelName,
+		LocalFastModel:   opts.LocalFastModel,
+		LocalHeavyModel:  opts.LocalHeavyModel,
+		OpenAIBaseURL:    opts.OpenAIBaseURL,
+		OpenAIAPIKey:     opts.OpenAIAPIKey,
+		OpenAIModel:      opts.OpenAIModel,
+		ExplicitProvider: opts.ExplicitProvider,
+	})
+	opts.RoutingMode = string(resolved.RoutingMode)
+	opts.ExplicitProvider = resolved.ExplicitProvider
+	opts.ActiveModel = resolved.ActiveModel
+	opts.LocalModelName = resolved.LocalModel
+	opts.CloudModelName = resolved.CloudModel
+	opts.LocalFastModel = resolved.LocalFastModel
+	opts.LocalHeavyModel = resolved.LocalHeavyModel
+	opts.OpenAIBaseURL = resolved.OpenAIBaseURL
+	opts.OpenAIAPIKey = resolved.OpenAIAPIKey
+	opts.OpenAIModel = resolved.OpenAIModel
 
 	mcpClients := make([]*mcp.Client, 0)
 	mcpRouter := make(map[string]*mcp.Client)

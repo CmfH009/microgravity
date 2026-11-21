@@ -48,88 +48,33 @@ var (
 )
 
 func resolveRoutingMode(cfg *config.Config, localFlag bool, routingModeFlag string) string {
-	if localFlag {
-		return string(router.ModeLocalOnly)
-	}
-	if strings.TrimSpace(routingModeFlag) != "" {
-		return string(router.NormalizeRoutingMode(routingModeFlag))
-	}
-	if envMode, ok := router.RoutingModeFromEnv(); ok {
-		return string(envMode)
-	}
-	if cfg != nil && strings.TrimSpace(cfg.RoutingMode) != "" {
-		return string(router.NormalizeRoutingMode(cfg.RoutingMode))
-	}
-	return string(router.ModeHybrid)
+	return string(router.ResolveRoutingMode(cfg, localFlag, routingModeFlag))
 }
 
 func resolveOpenAIBaseURL(cfg *config.Config, baseURLFlag string) string {
-	if strings.TrimSpace(baseURLFlag) != "" {
-		return strings.TrimSpace(baseURLFlag)
-	}
-	if envURL := strings.TrimSpace(os.Getenv("MG_OPENAI_BASE_URL")); envURL != "" {
-		return envURL
-	}
-	if cfg != nil && strings.TrimSpace(cfg.OpenAIBaseURL) != "" {
-		return strings.TrimSpace(cfg.OpenAIBaseURL)
-	}
-	return ""
+	return router.ResolveOpenAIBaseURL(cfg, baseURLFlag)
 }
 
 func resolveOpenAIAPIKey(cfg *config.Config) string {
-	if envKey := strings.TrimSpace(os.Getenv("MG_OPENAI_API_KEY")); envKey != "" {
-		return envKey
-	}
-	if cfg != nil && strings.TrimSpace(cfg.OpenAIAPIKey) != "" {
-		return strings.TrimSpace(cfg.OpenAIAPIKey)
-	}
-	return ""
+	return router.ResolveOpenAIAPIKey(cfg, "")
 }
 
 func resolveLocalTierModels(cfg *config.Config, fastFlag, heavyFlag, fallbackLocal string) (string, string) {
-	fast := strings.TrimSpace(fastFlag)
-	if fast == "" {
-		fast = strings.TrimSpace(os.Getenv("MG_LOCAL_FAST_MODEL"))
-	}
-	if fast == "" && cfg != nil {
-		fast = strings.TrimSpace(cfg.LocalFastModel)
-	}
-	if fast == "" {
-		fast = strings.TrimSpace(fallbackLocal)
-	}
-
-	heavy := strings.TrimSpace(heavyFlag)
-	if heavy == "" {
-		heavy = strings.TrimSpace(os.Getenv("MG_LOCAL_HEAVY_MODEL"))
-	}
-	if heavy == "" && cfg != nil {
-		heavy = strings.TrimSpace(cfg.LocalHeavyModel)
-	}
-	return fast, heavy
+	return router.ResolveLocalTierModels(cfg, fastFlag, heavyFlag, fallbackLocal)
 }
 
 func shouldSkipCloudAuth(cfg *config.Config, localFlag bool, routingModeFlag, baseURLFlag string) bool {
-	if localFlag {
-		return true
-	}
-	if resolveRoutingMode(cfg, localFlag, routingModeFlag) == string(router.ModeLocalOnly) {
-		return true
-	}
-	if resolveOpenAIBaseURL(cfg, baseURLFlag) != "" {
-		return true
-	}
-	if rootModel != "" && !isCloudModelID(rootModel) {
-		return true
-	}
-	if rootModel == "" && cfg != nil && strings.TrimSpace(cfg.ActiveModel) != "" && !isCloudModelID(cfg.ActiveModel) {
-		return true
-	}
-	return false
+	return router.ResolveConfig(router.ConfigInput{
+		Config:      cfg,
+		LocalFlag:   localFlag,
+		RoutingMode: routingModeFlag,
+		ModelFlag:   rootModel,
+		OpenAIBaseURL: baseURLFlag,
+	}).SkipCloudAuth()
 }
 
 func isCloudModelID(modelID string) bool {
-	lower := strings.ToLower(strings.TrimSpace(modelID))
-	return strings.HasPrefix(lower, "gemini-") || strings.HasPrefix(lower, "gemma-2-") || lower == "flash" || lower == "pro"
+	return router.IsCloudModel(modelID)
 }
 
 var rootCmd = &cobra.Command{
@@ -216,56 +161,35 @@ func executePrintMode(prompt string) {
 	}
 
 	cfg, _ := config.LoadConfig()
-	activeID := config.GetActiveModel()
-	if rootModel != "" {
-		activeID = rootModel
-	}
-
-	routingMode := resolveRoutingMode(cfg, rootLocal, rootRoutingMode)
-	openAIBaseURL := resolveOpenAIBaseURL(cfg, rootBaseURL)
-	openAIAPIKey := resolveOpenAIAPIKey(cfg)
-	localFast, localHeavy := resolveLocalTierModels(cfg, rootLocalFastModel, rootLocalHeavyModel, "")
-	openAIModel := ""
-	if cfg != nil {
-		openAIModel = strings.TrimSpace(cfg.OpenAIModel)
-	}
+	resolved := router.ResolveConfig(router.ConfigInput{
+		Config:          cfg,
+		LocalFlag:       rootLocal,
+		RoutingMode:     rootRoutingMode,
+		ModelFlag:       rootModel,
+		LocalFastModel:  rootLocalFastModel,
+		LocalHeavyModel: rootLocalHeavyModel,
+		OpenAIBaseURL:   rootBaseURL,
+	})
 
 	opts := SessionOptions{
-		SessionName:     sessionName,
-		ActiveModel:     activeID,
-		Mode:            rootMode,
-		Effort:          rootEffort,
-		AutoApprove:     rootDangerouslySkip || true,
-		DisableSlash:    rootDisableSlash,
-		AddDirs:         rootAddDirs,
-		Sandbox:         rootSandbox,
-		DryRun:          rootDryRun,
-		RoutingMode:     routingMode,
-		LocalFastModel:  localFast,
-		LocalHeavyModel: localHeavy,
-		OpenAIBaseURL:   openAIBaseURL,
-		OpenAIAPIKey:    openAIAPIKey,
-		OpenAIModel:     openAIModel,
-	}
-
-	if openAIBaseURL != "" {
-		opts.ExplicitProvider = "openai"
-		if rootModel != "" {
-			opts.OpenAIModel = rootModel
-		}
-	} else if routingMode == string(router.ModeLocalOnly) {
-		if rootModel != "" && !isCloudModelID(rootModel) {
-			opts.LocalModelName = rootModel
-			if opts.LocalFastModel == "" {
-				opts.LocalFastModel = rootModel
-			}
-		}
-	} else if activeID != "" && !isCloudModelID(activeID) {
-		opts.LocalModelName = activeID
-		opts.ExplicitProvider = "ollama"
-	} else if isCloudModelID(activeID) {
-		opts.CloudModelName = activeID
-		opts.ExplicitProvider = "cloud"
+		SessionName:      sessionName,
+		ActiveModel:      resolved.ActiveModel,
+		LocalModelName:   resolved.LocalModel,
+		CloudModelName:   resolved.CloudModel,
+		Mode:             rootMode,
+		Effort:           rootEffort,
+		AutoApprove:      rootDangerouslySkip || true,
+		DisableSlash:     rootDisableSlash,
+		AddDirs:          rootAddDirs,
+		Sandbox:          rootSandbox,
+		DryRun:           rootDryRun,
+		ExplicitProvider: resolved.ExplicitProvider,
+		RoutingMode:      string(resolved.RoutingMode),
+		LocalFastModel:   resolved.LocalFastModel,
+		LocalHeavyModel:  resolved.LocalHeavyModel,
+		OpenAIBaseURL:    resolved.OpenAIBaseURL,
+		OpenAIAPIKey:     resolved.OpenAIAPIKey,
+		OpenAIModel:      resolved.OpenAIModel,
 	}
 
 	sess, cleanup, err := BuildEngineSession(ctx, opts)

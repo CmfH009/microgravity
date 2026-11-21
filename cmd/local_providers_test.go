@@ -285,3 +285,48 @@ func TestShouldSkipCloudAuth_LocalActiveModel(t *testing.T) {
 		})
 	}
 }
+
+func TestUnifiedRoutingResolution_NoTuiOrPrintDrift(t *testing.T) {
+	tmp := isolateCmdTestEnv(t)
+
+	// 1. Local active model persisted in config must NOT overwrite CloudModelName and must route to ollama.
+	sess, cleanup, err := BuildEngineSession(context.Background(), SessionOptions{
+		SessionName:    "tui-local-model-check",
+		Cwd:            tmp,
+		ActiveModel:    "orbit-thinker:latest",
+		LocalModelName: "gemma:2b",
+		CloudModelName: "gemini-3.6-flash",
+	})
+	if err != nil {
+		t.Fatalf("BuildEngineSession failed: %v", err)
+	}
+	defer cleanup()
+
+	if sess.Config.CloudModelName != "gemini-3.6-flash" {
+		t.Fatalf("local ActiveModel polluted CloudModelName: got %q, want gemini-3.6-flash", sess.Config.CloudModelName)
+	}
+	if sess.Config.LocalModelName != "orbit-thinker:latest" {
+		t.Fatalf("expected LocalModelName=orbit-thinker:latest, got %q", sess.Config.LocalModelName)
+	}
+	if sess.Config.ExplicitProvider != "ollama" {
+		t.Fatalf("expected ExplicitProvider=ollama for local ActiveModel, got %q", sess.Config.ExplicitProvider)
+	}
+
+	// 2. Default cloud model in hybrid mode (without explicit --model flag) must NOT force ExplicitProvider="cloud".
+	sessHybrid, cleanupHybrid, err := BuildEngineSession(context.Background(), SessionOptions{
+		SessionName:    "hybrid-default-check",
+		Cwd:            tmp,
+		CloudModelName: "gemini-3.6-flash",
+	})
+	if err != nil {
+		t.Fatalf("BuildEngineSession hybrid failed: %v", err)
+	}
+	defer cleanupHybrid()
+
+	if sessHybrid.Config.ExplicitProvider != "" {
+		t.Fatalf("default hybrid session must leave ExplicitProvider empty, got %q", sessHybrid.Config.ExplicitProvider)
+	}
+	if sessHybrid.Config.RoutingMode != "hybrid" {
+		t.Fatalf("expected RoutingMode=hybrid, got %q", sessHybrid.Config.RoutingMode)
+	}
+}

@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -17,12 +16,14 @@ import (
 
 	"github.com/CmfH009/microgravity/internal/budget"
 	"github.com/CmfH009/microgravity/internal/cmdparse"
+	"github.com/CmfH009/microgravity/internal/httputil"
 	"github.com/CmfH009/microgravity/internal/mcp"
+	"github.com/CmfH009/microgravity/internal/router"
 )
 
 const (
 	defaultBaseURL    = "http://localhost:11434"
-	maxErrorBodyBytes = 64 * 1024
+	maxErrorBodyBytes = httputil.MaxErrorBodyBytes
 )
 
 var (
@@ -39,22 +40,12 @@ type Client struct {
 	HTTPClient *http.Client
 }
 
+var _ router.Provider = (*Client)(nil)
+
 func newDefaultHTTPClient() *http.Client {
-	transport := &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
-		DialContext: (&net.Dialer{
-			Timeout:   15 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
+	return httputil.NewClient(httputil.ClientConfig{
 		ResponseHeaderTimeout: 3 * time.Minute,
-		IdleConnTimeout:       90 * time.Second,
-		MaxIdleConns:          32,
-		MaxIdleConnsPerHost:   8,
-	}
-	return &http.Client{
-		Transport: transport,
-		Timeout:   10 * time.Minute,
-	}
+	})
 }
 
 func NewClient(baseURL string) *Client {
@@ -82,21 +73,11 @@ func (c *Client) baseURL() string {
 }
 
 func drainAndClose(body io.ReadCloser) {
-	if body == nil {
-		return
-	}
-	_, _ = io.Copy(io.Discard, io.LimitReader(body, maxErrorBodyBytes))
-	_ = body.Close()
+	httputil.DrainAndClose(body)
 }
 
 func readBoundedErrorBody(body io.ReadCloser) string {
-	if body == nil {
-		return ""
-	}
-	data, _ := io.ReadAll(io.LimitReader(body, maxErrorBodyBytes))
-	_, _ = io.Copy(io.Discard, io.LimitReader(body, maxErrorBodyBytes))
-	_ = body.Close()
-	return strings.TrimSpace(string(data))
+	return httputil.ReadBoundedErrorBody(body)
 }
 
 func EnsureOllama() {
@@ -147,10 +128,7 @@ type OllamaToolCallFunction struct {
 	Arguments map[string]interface{} `json:"arguments"`
 }
 
-type GenerateResult struct {
-	Text      string
-	ToolCalls []cmdparse.ToolCall
-}
+type GenerateResult = router.GenerateResult
 
 type ChatMessage struct {
 	Role      string           `json:"role"`
@@ -444,7 +422,7 @@ func min(a, b int) int {
 
 // estimateTokens approximates token count from text length (~4 chars/token).
 func estimateTokens(s string) int {
-	return (len(s) + 3) / 4
+	return httputil.EstimateTokens(s)
 }
 
 type PullRequest struct {

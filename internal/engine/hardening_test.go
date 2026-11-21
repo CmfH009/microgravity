@@ -3,11 +3,9 @@ package engine_test
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,10 +16,13 @@ import (
 	"time"
 
 	"github.com/CmfH009/microgravity/internal/cloud"
+	"github.com/CmfH009/microgravity/internal/cmdparse"
 	"github.com/CmfH009/microgravity/internal/engine"
 	"github.com/CmfH009/microgravity/internal/events"
 	"github.com/CmfH009/microgravity/internal/mcp"
+	"github.com/CmfH009/microgravity/internal/memory"
 	"github.com/CmfH009/microgravity/internal/ollama"
+	"github.com/CmfH009/microgravity/internal/router"
 	"github.com/CmfH009/microgravity/internal/tools"
 )
 
@@ -44,39 +45,34 @@ func isolateEngineTestEnv(t *testing.T) {
 	t.Setenv("MG_OPENAI_API_KEY", "")
 }
 
+type ioDiscard struct{}
+
+func (ioDiscard) Write(p []byte) (int, error) { return len(p), nil }
+
 func TestTurn_CloudQuotaExhaustedFailoverToOllama(t *testing.T) {
 	tests := []struct {
 		name             string
 		explicitProvider string
 		prompt           string
-		cloudHandler     http.HandlerFunc
+		cloudErr         error
 	}{
 		{
 			name:             "Explicit cloud 402 billing fails over to local Ollama",
 			explicitProvider: "cloud",
 			prompt:           "design distributed queue",
-			cloudHandler: func(w http.ResponseWriter, r *http.Request) {
-				w.WriteHeader(http.StatusPaymentRequired)
-				_, _ = w.Write([]byte(`{"error":{"code":402,"message":"billing disabled"}}`))
-			},
+			cloudErr:         fmt.Errorf("%w (status 402): billing disabled", cloud.ErrQuotaExhausted),
 		},
 		{
 			name:             "Explicit cloud 429 RESOURCE_EXHAUSTED fails over to local Ollama",
 			explicitProvider: "cloud",
 			prompt:           "implement failover check",
-			cloudHandler: func(w http.ResponseWriter, r *http.Request) {
-				w.WriteHeader(http.StatusTooManyRequests)
-				_, _ = w.Write([]byte(`{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","message":"quota exhausted"}}`))
-			},
+			cloudErr:         fmt.Errorf("%w (status 429): RESOURCE_EXHAUSTED", cloud.ErrQuotaExhausted),
 		},
 		{
 			name:             "Auto routing complex SSE RESOURCE_EXHAUSTED fails over to local Ollama",
 			explicitProvider: "",
 			prompt:           "architect and implement resilient failover pipeline",
-			cloudHandler: func(w http.ResponseWriter, r *http.Request) {
-				w.Header().Set("Content-Type", "text/event-stream")
-				_, _ = w.Write([]byte(`data: {"error":{"code":429,"status":"RESOURCE_EXHAUSTED","message":"stream quota exceeded"}}` + "\n\n"))
-			},
+			cloudErr:         fmt.Errorf("%w: stream quota exceeded", cloud.ErrQuotaExhausted),
 		},
 	}
 
@@ -85,18 +81,15 @@ func TestTurn_CloudQuotaExhaustedFailoverToOllama(t *testing.T) {
 			isolateEngineTestEnv(t)
 
 			var cloudHits, ollamaHits int32
-			cloudSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			fakeCloud := router.ProviderFunc(func(ctx context.Context, model, prompt string, images []string, tools []mcp.Tool, out io.Writer) (*router.GenerateResult, error) {
 				atomic.AddInt32(&cloudHits, 1)
-				tc.cloudHandler(w, r)
-			}))
-			defer cloudSrv.Close()
-
-			ollamaSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				return nil, tc.cloudErr
+			})
+			fakeOllama := router.ProviderFunc(func(ctx context.Context, model, prompt string, images []string, tools []mcp.Tool, out io.Writer) (*router.GenerateResult, error) {
 				atomic.AddInt32(&ollamaHits, 1)
-				w.Header().Set("Content-Type", "application/x-ndjson")
-				_, _ = w.Write([]byte(`{"message":{"role":"assistant","content":"handled locally"},"done":true}` + "\n"))
-			}))
-			defer ollamaSrv.Close()
+				_, _ = io.WriteString(out, "handled locally")
+				return &router.GenerateResult{Text: "handled locally"}, nil
+			})
 
 			sess, err := engine.NewSession(engine.SessionConfig{
 				SessionName:      "failover-test",
@@ -104,15 +97,16 @@ func TestTurn_CloudQuotaExhaustedFailoverToOllama(t *testing.T) {
 				CloudModelName:   "gemini-3.8-flash",
 				ActiveModel:      "gemini-3.8-flash",
 				LocalModelName:   "gemma4:e2b",
-				OllamaBaseURL:    ollamaSrv.URL,
 				CoreMemory:       "<core_memory></core_memory>",
+				Providers: router.Providers{
+					Cloud:  fakeCloud,
+					Ollama: fakeOllama,
+				},
 			})
 			if err != nil {
 				t.Fatalf("NewSession failed: %v", err)
 			}
 			defer sess.Close()
-			sess.CloudClient.BaseURL = cloudSrv.URL
-			sess.CloudClient.APIKey = "test-key"
 
 			var out bytes.Buffer
 			resp, err := sess.ExecuteTurn(context.Background(), tc.prompt, nil, &out)
@@ -122,8 +116,8 @@ func TestTurn_CloudQuotaExhaustedFailoverToOllama(t *testing.T) {
 			if resp != "handled locally" {
 				t.Fatalf("expected 'handled locally', got %q", resp)
 			}
-			if atomic.LoadInt32(&cloudHits) == 0 {
-				t.Fatal("expected cloud endpoint to be attempted first")
+			if atomic.LoadInt32(&cloudHits) != 1 {
+				t.Fatalf("expected cloud provider to be attempted once, got %d", cloudHits)
 			}
 			if atomic.LoadInt32(&ollamaHits) != 1 {
 				t.Fatalf("expected exactly 1 Ollama fallback call, got %d", ollamaHits)
@@ -135,33 +129,26 @@ func TestTurn_CloudQuotaExhaustedFailoverToOllama(t *testing.T) {
 func TestTurn_CloudAndOllamaBothFail_PreservesBothErrors(t *testing.T) {
 	isolateEngineTestEnv(t)
 
-	cloudSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusPaymentRequired)
-		_, _ = w.Write([]byte(`{"error":{"code":402,"message":"cloud billing exhausted"}}`))
-	}))
-	defer cloudSrv.Close()
-
-	ollamaSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusNotFound)
-		_, _ = w.Write([]byte(`{"error":"model gemma4:e2b not found"}`))
-	}))
-	defer ollamaSrv.Close()
-
 	sess, err := engine.NewSession(engine.SessionConfig{
 		SessionName:      "both-fail-test",
 		ExplicitProvider: "cloud",
 		CloudModelName:   "gemini-3.8-flash",
 		ActiveModel:      "gemini-3.8-flash",
 		LocalModelName:   "gemma4:e2b",
-		OllamaBaseURL:    ollamaSrv.URL,
 		CoreMemory:       "<core_memory></core_memory>",
+		Providers: router.Providers{
+			Cloud: router.ProviderFunc(func(ctx context.Context, model, prompt string, images []string, tools []mcp.Tool, out io.Writer) (*router.GenerateResult, error) {
+				return nil, fmt.Errorf("%w: cloud billing exhausted", cloud.ErrQuotaExhausted)
+			}),
+			Ollama: router.ProviderFunc(func(ctx context.Context, model, prompt string, images []string, tools []mcp.Tool, out io.Writer) (*router.GenerateResult, error) {
+				return nil, fmt.Errorf("%w: model gemma4:e2b not found", ollama.ErrModelNotFound)
+			}),
+		},
 	})
 	if err != nil {
 		t.Fatalf("NewSession failed: %v", err)
 	}
 	defer sess.Close()
-	sess.CloudClient.BaseURL = cloudSrv.URL
-	sess.CloudClient.APIKey = "test-key"
 
 	var out bytes.Buffer
 	_, err = sess.ExecuteTurn(context.Background(), "hello", nil, &out)
@@ -180,31 +167,24 @@ func TestTurn_AutoRoutingSimpleDoesNotLoopOllamaTwice(t *testing.T) {
 	isolateEngineTestEnv(t)
 
 	var ollamaHits, cloudHits int32
-	ollamaSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&ollamaHits, 1)
-		w.WriteHeader(http.StatusInternalServerError)
-		_, _ = w.Write([]byte(`{"error":"ollama crashed"}`))
-	}))
-	defer ollamaSrv.Close()
-
-	cloudSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&cloudHits, 1)
-		w.WriteHeader(http.StatusPaymentRequired)
-		_, _ = w.Write([]byte(`{"error":{"code":402,"message":"billing exhausted"}}`))
-	}))
-	defer cloudSrv.Close()
-
 	sess, err := engine.NewSession(engine.SessionConfig{
-		SessionName:   "no-double-ollama",
-		OllamaBaseURL: ollamaSrv.URL,
-		CoreMemory:    "<core_memory></core_memory>",
+		SessionName: "no-double-ollama",
+		CoreMemory:  "<core_memory></core_memory>",
+		Providers: router.Providers{
+			Ollama: router.ProviderFunc(func(ctx context.Context, model, prompt string, images []string, tools []mcp.Tool, out io.Writer) (*router.GenerateResult, error) {
+				atomic.AddInt32(&ollamaHits, 1)
+				return nil, errors.New("ollama crashed")
+			}),
+			Cloud: router.ProviderFunc(func(ctx context.Context, model, prompt string, images []string, tools []mcp.Tool, out io.Writer) (*router.GenerateResult, error) {
+				atomic.AddInt32(&cloudHits, 1)
+				return nil, fmt.Errorf("%w: billing exhausted", cloud.ErrQuotaExhausted)
+			}),
+		},
 	})
 	if err != nil {
 		t.Fatalf("NewSession failed: %v", err)
 	}
 	defer sess.Close()
-	sess.CloudClient.BaseURL = cloudSrv.URL
-	sess.CloudClient.APIKey = "test-key"
 
 	var out bytes.Buffer
 	_, err = sess.ExecuteTurn(context.Background(), "hi", nil, &out)
@@ -215,7 +195,7 @@ func TestTurn_AutoRoutingSimpleDoesNotLoopOllamaTwice(t *testing.T) {
 		t.Fatalf("expected Ollama to be tried ONCE (not duplicated after cloud failure), got %d", got)
 	}
 	if got := atomic.LoadInt32(&cloudHits); got != 1 {
-		t.Fatalf("expected Cloud to be tried ONCE (402 fails fast), got %d", got)
+		t.Fatalf("expected Cloud to be tried ONCE, got %d", got)
 	}
 }
 
@@ -224,53 +204,37 @@ func TestTurn_ContextCancellationNoFailoverAndNoPostReturnWrites(t *testing.T) {
 
 	var ollamaHits int32
 	cloudStarted := make(chan struct{})
-	testDone := make(chan struct{})
-	cloudSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		flusher, _ := w.(http.Flusher)
-		_, _ = w.Write([]byte(`data: {"candidates":[{"content":{"parts":[{"text":"partial"}]}}]}` + "\n\n"))
-		if flusher != nil {
-			flusher.Flush()
-		}
-		select {
-		case <-cloudStarted:
-		default:
-			close(cloudStarted)
-		}
-		select {
-		case <-r.Context().Done():
-		case <-testDone:
-		}
-	}))
-	defer func() {
-		close(testDone)
-		cloudSrv.Close()
-	}()
-
-	ollamaSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&ollamaHits, 1)
-		w.Header().Set("Content-Type", "application/x-ndjson")
-		_, _ = w.Write([]byte(`{"message":{"role":"assistant","content":"should not run"},"done":true}` + "\n"))
-	}))
-	defer ollamaSrv.Close()
 
 	sess, err := engine.NewSession(engine.SessionConfig{
 		SessionName:      "cancel-no-failover",
 		ExplicitProvider: "cloud",
-		OllamaBaseURL:    ollamaSrv.URL,
 		CoreMemory:       "<core_memory></core_memory>",
+		Providers: router.Providers{
+			Cloud: router.ProviderFunc(func(ctx context.Context, model, prompt string, images []string, tools []mcp.Tool, out io.Writer) (*router.GenerateResult, error) {
+				_, _ = io.WriteString(out, "partial")
+				select {
+				case <-cloudStarted:
+				default:
+					close(cloudStarted)
+				}
+				<-ctx.Done()
+				return nil, ctx.Err()
+			}),
+			Ollama: router.ProviderFunc(func(ctx context.Context, model, prompt string, images []string, tools []mcp.Tool, out io.Writer) (*router.GenerateResult, error) {
+				atomic.AddInt32(&ollamaHits, 1)
+				return &router.GenerateResult{Text: "should not run"}, nil
+			}),
+		},
 	})
 	if err != nil {
 		t.Fatalf("NewSession failed: %v", err)
 	}
 	defer sess.Close()
-	sess.CloudClient.BaseURL = cloudSrv.URL
-	sess.CloudClient.APIKey = "test-key"
 
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
 		<-cloudStarted
-		time.Sleep(20 * time.Millisecond)
+		time.Sleep(15 * time.Millisecond)
 		cancel()
 	}()
 
@@ -293,26 +257,25 @@ func TestTurn_BoundedMaxTurns(t *testing.T) {
 	})
 
 	var calls int32
-	cloudSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&calls, 1)
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = w.Write([]byte(`data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"noop","args":{}}}]}}]}` + "\n\n"))
-	}))
-	defer cloudSrv.Close()
-
 	sess, err := engine.NewSession(engine.SessionConfig{
 		SessionName:      "max-turns",
 		ExplicitProvider: "cloud",
 		Registry:         reg,
 		MaxTurns:         3,
 		CoreMemory:       "<core_memory></core_memory>",
+		Providers: router.Providers{
+			Cloud: router.ProviderFunc(func(ctx context.Context, model, prompt string, images []string, tools []mcp.Tool, out io.Writer) (*router.GenerateResult, error) {
+				atomic.AddInt32(&calls, 1)
+				return &router.GenerateResult{
+					ToolCalls: []cmdparse.ToolCall{{ToolCall: "noop", Arguments: map[string]interface{}{}}},
+				}, nil
+			}),
+		},
 	})
 	if err != nil {
 		t.Fatalf("NewSession failed: %v", err)
 	}
 	defer sess.Close()
-	sess.CloudClient.BaseURL = cloudSrv.URL
-	sess.CloudClient.APIKey = "test-key"
 
 	var out bytes.Buffer
 	_, err = sess.ExecuteTurn(context.Background(), "loop forever", nil, &out)
@@ -329,40 +292,35 @@ func TestTurn_AsyncEventPreemptsLLMWithoutRace(t *testing.T) {
 
 	var reqCount int32
 	firstHung := make(chan struct{})
-	cloudSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		n := atomic.AddInt32(&reqCount, 1)
-		w.Header().Set("Content-Type", "text/event-stream")
-		if n == 1 {
-			flusher, _ := w.(http.Flusher)
-			_, _ = w.Write([]byte(`data: {"candidates":[{"content":{"parts":[{"text":"starting "}]}}]}` + "\n\n"))
-			if flusher != nil {
-				flusher.Flush()
-			}
-			select {
-			case <-firstHung:
-			default:
-				close(firstHung)
-			}
-			<-r.Context().Done()
-			return
-		}
-		_, _ = w.Write([]byte(`data: {"candidates":[{"content":{"parts":[{"text":"resumed after async"}]}}]}` + "\n\n"))
-	}))
-	defer cloudSrv.Close()
-
 	eb := events.NewEventBus()
+
 	sess, err := engine.NewSession(engine.SessionConfig{
 		SessionName:      "async-race",
 		ExplicitProvider: "cloud",
 		EventBus:         eb,
 		CoreMemory:       "<core_memory></core_memory>",
+		Providers: router.Providers{
+			Cloud: router.ProviderFunc(func(ctx context.Context, model, prompt string, images []string, tools []mcp.Tool, out io.Writer) (*router.GenerateResult, error) {
+				n := atomic.AddInt32(&reqCount, 1)
+				if n == 1 {
+					_, _ = io.WriteString(out, "starting ")
+					select {
+					case <-firstHung:
+					default:
+						close(firstHung)
+					}
+					<-ctx.Done()
+					return nil, ctx.Err()
+				}
+				_, _ = io.WriteString(out, "resumed after async")
+				return &router.GenerateResult{Text: "resumed after async"}, nil
+			}),
+		},
 	})
 	if err != nil {
 		t.Fatalf("NewSession failed: %v", err)
 	}
 	defer sess.Close()
-	sess.CloudClient.BaseURL = cloudSrv.URL
-	sess.CloudClient.APIKey = "test-key"
 
 	go func() {
 		<-firstHung
@@ -391,7 +349,6 @@ func TestSession_CloseIdempotentWithFullAsyncEvents(t *testing.T) {
 		t.Fatalf("NewSession failed: %v", err)
 	}
 
-	// Overflow AsyncEvents capacity (100) so forwarders block on channel send.
 	for i := 0; i < 150; i++ {
 		eb.Publish("task_completed", "overflow")
 	}
@@ -453,48 +410,44 @@ func TestSession_ConcurrentCheckpointAndMessages_Race(t *testing.T) {
 
 func TestTurn_LocalOnlyMultiTierOllamaRouting(t *testing.T) {
 	tests := []struct {
-		name           string
-		prompt         string
-		localHeavy     string
-		wantModel      string
-		ollamaStatus   int
-		wantErr        bool
-		explicitProv   string
+		name         string
+		prompt       string
+		localHeavy   string
+		wantModel    string
+		ollamaErr    error
+		wantErr      bool
+		explicitProv string
 	}{
 		{
-			name:         "simple prompt routes to LocalFastModel with 0 cloud requests",
-			prompt:       "hi",
-			localHeavy:   "qwen2.5-coder:7b",
-			wantModel:    "gemma4:e2b",
-			ollamaStatus: http.StatusOK,
+			name:       "simple prompt routes to LocalFastModel with 0 cloud requests",
+			prompt:     "hi",
+			localHeavy: "qwen2.5-coder:7b",
+			wantModel:  "gemma4:e2b",
 		},
 		{
-			name:         "complex coding prompt routes to LocalHeavyModel with 0 cloud requests",
-			prompt:       "refactor and optimize this consensus module",
-			localHeavy:   "qwen2.5-coder:7b",
-			wantModel:    "qwen2.5-coder:7b",
-			ollamaStatus: http.StatusOK,
+			name:       "complex coding prompt routes to LocalHeavyModel with 0 cloud requests",
+			prompt:     "refactor and optimize this consensus module",
+			localHeavy: "qwen2.5-coder:7b",
+			wantModel:  "qwen2.5-coder:7b",
 		},
 		{
-			name:         "long prompt >150 chars routes to LocalHeavyModel with 0 cloud requests",
-			prompt:       strings.Repeat("x", 180),
-			localHeavy:   "qwen2.5-coder:7b",
-			wantModel:    "qwen2.5-coder:7b",
-			ollamaStatus: http.StatusOK,
+			name:       "long prompt >150 chars routes to LocalHeavyModel with 0 cloud requests",
+			prompt:     strings.Repeat("x", 180),
+			localHeavy: "qwen2.5-coder:7b",
+			wantModel:  "qwen2.5-coder:7b",
 		},
 		{
-			name:         "empty LocalHeavyModel falls back to LocalFastModel",
-			prompt:       "debug this race condition",
-			localHeavy:   "",
-			wantModel:    "gemma4:e2b",
-			ollamaStatus: http.StatusOK,
+			name:       "empty LocalHeavyModel falls back to LocalFastModel",
+			prompt:     "debug this race condition",
+			localHeavy: "",
+			wantModel:  "gemma4:e2b",
 		},
 		{
 			name:         "ollama failure under local-only NEVER falls back to cloud",
 			prompt:       "hi",
 			localHeavy:   "qwen2.5-coder:7b",
 			wantModel:    "gemma4:e2b",
-			ollamaStatus: http.StatusInternalServerError,
+			ollamaErr:    errors.New("local ollama down"),
 			wantErr:      true,
 			explicitProv: "cloud",
 		},
@@ -505,31 +458,8 @@ func TestTurn_LocalOnlyMultiTierOllamaRouting(t *testing.T) {
 			isolateEngineTestEnv(t)
 
 			var cloudHits int32
-			cloudSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				atomic.AddInt32(&cloudHits, 1)
-				w.Header().Set("Content-Type", "text/event-stream")
-				_, _ = w.Write([]byte(`data: {"candidates":[{"content":{"parts":[{"text":"cloud-forbidden"}]}}]}` + "\n\n"))
-			}))
-			defer cloudSrv.Close()
-
 			var gotModels []string
 			var modelsMu sync.Mutex
-			ollamaSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				var req ollama.ChatRequest
-				_ = json.NewDecoder(r.Body).Decode(&req)
-				modelsMu.Lock()
-				gotModels = append(gotModels, req.Model)
-				modelsMu.Unlock()
-
-				if tc.ollamaStatus != http.StatusOK {
-					w.WriteHeader(tc.ollamaStatus)
-					_, _ = w.Write([]byte(`{"error":"local ollama down"}`))
-					return
-				}
-				w.Header().Set("Content-Type", "application/x-ndjson")
-				_, _ = w.Write([]byte(`{"message":{"role":"assistant","content":"local:` + req.Model + `"},"done":true}` + "\n"))
-			}))
-			defer ollamaSrv.Close()
 
 			sess, err := engine.NewSession(engine.SessionConfig{
 				SessionName:      "local-only-tiers",
@@ -537,17 +467,29 @@ func TestTurn_LocalOnlyMultiTierOllamaRouting(t *testing.T) {
 				ExplicitProvider: tc.explicitProv,
 				LocalFastModel:   "gemma4:e2b",
 				LocalHeavyModel:  tc.localHeavy,
-				OllamaBaseURL:    ollamaSrv.URL,
 				CloudModelName:   "gemini-3.6-flash",
 				ActiveModel:      "gemini-3.6-flash",
 				CoreMemory:       "<core_memory></core_memory>",
+				Providers: router.Providers{
+					Cloud: router.ProviderFunc(func(ctx context.Context, model, prompt string, images []string, tools []mcp.Tool, out io.Writer) (*router.GenerateResult, error) {
+						atomic.AddInt32(&cloudHits, 1)
+						return &router.GenerateResult{Text: "cloud-forbidden"}, nil
+					}),
+					Ollama: router.ProviderFunc(func(ctx context.Context, model, prompt string, images []string, tools []mcp.Tool, out io.Writer) (*router.GenerateResult, error) {
+						modelsMu.Lock()
+						gotModels = append(gotModels, model)
+						modelsMu.Unlock()
+						if tc.ollamaErr != nil {
+							return nil, tc.ollamaErr
+						}
+						return &router.GenerateResult{Text: "local:" + model}, nil
+					}),
+				},
 			})
 			if err != nil {
 				t.Fatalf("NewSession failed: %v", err)
 			}
 			defer sess.Close()
-			sess.CloudClient.BaseURL = cloudSrv.URL
-			sess.CloudClient.APIKey = "test-key"
 
 			var out bytes.Buffer
 			resp, err := sess.ExecuteTurn(context.Background(), tc.prompt, nil, &out)
@@ -565,7 +507,7 @@ func TestTurn_LocalOnlyMultiTierOllamaRouting(t *testing.T) {
 			}
 
 			if got := atomic.LoadInt32(&cloudHits); got != 0 {
-				t.Fatalf("cloud server must receive 0 requests in local-only mode, got %d", got)
+				t.Fatalf("cloud provider must receive 0 requests in local-only mode, got %d", got)
 			}
 			modelsMu.Lock()
 			defer modelsMu.Unlock()
@@ -580,31 +522,25 @@ func TestTurn_ExplicitOllamaNeverCallsCloud(t *testing.T) {
 	isolateEngineTestEnv(t)
 
 	var cloudHits int32
-	cloudSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&cloudHits, 1)
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer cloudSrv.Close()
-
-	ollamaSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-		_, _ = w.Write([]byte(`{"error":"ollama crashed"}`))
-	}))
-	defer ollamaSrv.Close()
-
 	sess, err := engine.NewSession(engine.SessionConfig{
 		SessionName:      "explicit-ollama-no-cloud",
 		ExplicitProvider: "ollama",
 		LocalModelName:   "gemma4:e2b",
-		OllamaBaseURL:    ollamaSrv.URL,
 		CoreMemory:       "<core_memory></core_memory>",
+		Providers: router.Providers{
+			Cloud: router.ProviderFunc(func(ctx context.Context, model, prompt string, images []string, tools []mcp.Tool, out io.Writer) (*router.GenerateResult, error) {
+				atomic.AddInt32(&cloudHits, 1)
+				return &router.GenerateResult{Text: "forbidden"}, nil
+			}),
+			Ollama: router.ProviderFunc(func(ctx context.Context, model, prompt string, images []string, tools []mcp.Tool, out io.Writer) (*router.GenerateResult, error) {
+				return nil, errors.New("ollama crashed")
+			}),
+		},
 	})
 	if err != nil {
 		t.Fatalf("NewSession failed: %v", err)
 	}
 	defer sess.Close()
-	sess.CloudClient.BaseURL = cloudSrv.URL
-	sess.CloudClient.APIKey = "test-key"
 
 	_, err = sess.ExecuteTurn(context.Background(), "hi", nil, ioDiscard{})
 	if err == nil {
@@ -615,51 +551,12 @@ func TestTurn_ExplicitOllamaNeverCallsCloud(t *testing.T) {
 	}
 }
 
-type ioDiscard struct{}
-
-func (ioDiscard) Write(p []byte) (int, error) { return len(p), nil }
-
 func TestTurn_OpenAICompatibleLocalEndpointDispatch(t *testing.T) {
 	isolateEngineTestEnv(t)
 
 	var cloudHits, ollamaHits, openAIHits int32
-	cloudSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&cloudHits, 1)
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer cloudSrv.Close()
-
-	ollamaSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&ollamaHits, 1)
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer ollamaSrv.Close()
-
 	var reqModels []string
-	var reqPaths []string
 	var reqMu sync.Mutex
-
-	openAISrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		n := atomic.AddInt32(&openAIHits, 1)
-		var payload struct {
-			Model string `json:"model"`
-		}
-		_ = json.NewDecoder(r.Body).Decode(&payload)
-		reqMu.Lock()
-		reqModels = append(reqModels, payload.Model)
-		reqPaths = append(reqPaths, r.URL.Path)
-		reqMu.Unlock()
-
-		w.Header().Set("Content-Type", "text/event-stream")
-		if n == 1 {
-			_, _ = w.Write([]byte(`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"echo_tool","arguments":"{\"msg\":\"ping\"}"}}]}}]}` + "\n\n"))
-			_, _ = w.Write([]byte("data: [DONE]\n\n"))
-			return
-		}
-		_, _ = w.Write([]byte(`data: {"choices":[{"index":0,"delta":{"content":"openai-local-ok"}}]}` + "\n\n"))
-		_, _ = w.Write([]byte("data: [DONE]\n\n"))
-	}))
-	defer openAISrv.Close()
 
 	reg := tools.NewRegistry()
 	var toolExecuted int32
@@ -678,19 +575,38 @@ func TestTurn_OpenAICompatibleLocalEndpointDispatch(t *testing.T) {
 	sess, err := engine.NewSession(engine.SessionConfig{
 		SessionName:   "openai-local-dispatch",
 		RoutingMode:   "local-only",
-		OpenAIBaseURL: openAISrv.URL + "/v1",
+		OpenAIBaseURL: "http://127.0.0.1:1234/v1",
 		OpenAIAPIKey:  "local-key",
 		OpenAIModel:   "llama-3.2-3b-instruct",
-		OllamaBaseURL: ollamaSrv.URL,
 		Registry:      reg,
 		CoreMemory:    "<core_memory></core_memory>",
+		Providers: router.Providers{
+			Cloud: router.ProviderFunc(func(ctx context.Context, model, prompt string, images []string, tools []mcp.Tool, out io.Writer) (*router.GenerateResult, error) {
+				atomic.AddInt32(&cloudHits, 1)
+				return &router.GenerateResult{Text: "cloud-forbidden"}, nil
+			}),
+			Ollama: router.ProviderFunc(func(ctx context.Context, model, prompt string, images []string, tools []mcp.Tool, out io.Writer) (*router.GenerateResult, error) {
+				atomic.AddInt32(&ollamaHits, 1)
+				return &router.GenerateResult{Text: "ollama-forbidden"}, nil
+			}),
+			OpenAI: router.ProviderFunc(func(ctx context.Context, model, prompt string, images []string, tools []mcp.Tool, out io.Writer) (*router.GenerateResult, error) {
+				n := atomic.AddInt32(&openAIHits, 1)
+				reqMu.Lock()
+				reqModels = append(reqModels, model)
+				reqMu.Unlock()
+				if n == 1 {
+					return &router.GenerateResult{
+						ToolCalls: []cmdparse.ToolCall{{ToolCall: "echo_tool", Arguments: map[string]interface{}{"msg": "ping"}}},
+					}, nil
+				}
+				return &router.GenerateResult{Text: "openai-local-ok"}, nil
+			}),
+		},
 	})
 	if err != nil {
 		t.Fatalf("NewSession failed: %v", err)
 	}
 	defer sess.Close()
-	sess.CloudClient.BaseURL = cloudSrv.URL
-	sess.CloudClient.APIKey = "test-key"
 
 	var out bytes.Buffer
 	resp, err := sess.ExecuteTurn(context.Background(), "run echo tool", nil, &out)
@@ -707,33 +623,31 @@ func TestTurn_OpenAICompatibleLocalEndpointDispatch(t *testing.T) {
 		t.Fatalf("expected 0 cloud hits, got %d", cloudHits)
 	}
 	if atomic.LoadInt32(&ollamaHits) != 0 {
-		t.Fatalf("expected 0 ollama /api/chat hits when OpenAIBaseURL is set, got %d", ollamaHits)
+		t.Fatalf("expected 0 ollama hits when OpenAIBaseURL is set, got %d", ollamaHits)
 	}
 	if atomic.LoadInt32(&openAIHits) != 2 {
 		t.Fatalf("expected 2 OpenAI requests (tool call + final response), got %d", openAIHits)
 	}
 	reqMu.Lock()
 	defer reqMu.Unlock()
-	if reqPaths[0] != "/v1/chat/completions" || reqModels[0] != "llama-3.2-3b-instruct" {
-		t.Fatalf("unexpected OpenAI request path/model: paths=%+v models=%+v", reqPaths, reqModels)
+	if reqModels[0] != "llama-3.2-3b-instruct" {
+		t.Fatalf("unexpected OpenAI request model: %+v", reqModels)
 	}
 }
 
 func TestTurn_SetRoutingModeConcurrent_Race(t *testing.T) {
 	isolateEngineTestEnv(t)
 
-	ollamaSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/x-ndjson")
-		_, _ = w.Write([]byte(`{"message":{"role":"assistant","content":"ok"},"done":true}` + "\n"))
-	}))
-	defer ollamaSrv.Close()
-
 	sess, err := engine.NewSession(engine.SessionConfig{
 		SessionName:    "routing-mode-race",
 		RoutingMode:    "local-only",
 		LocalFastModel: "gemma4:e2b",
-		OllamaBaseURL:  ollamaSrv.URL,
 		CoreMemory:     "<core_memory></core_memory>",
+		Providers: router.Providers{
+			Ollama: router.ProviderFunc(func(ctx context.Context, model, prompt string, images []string, tools []mcp.Tool, out io.Writer) (*router.GenerateResult, error) {
+				return &router.GenerateResult{Text: "ok"}, nil
+			}),
+		},
 	})
 	if err != nil {
 		t.Fatalf("NewSession failed: %v", err)
@@ -762,43 +676,33 @@ func TestTurn_SetRoutingModeConcurrent_Race(t *testing.T) {
 func TestTurn_LocalActiveModel_HybridNeverCallsCloud(t *testing.T) {
 	isolateEngineTestEnv(t)
 
-	var cloudHits int32
-	cloudSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&cloudHits, 1)
-		w.WriteHeader(http.StatusPaymentRequired)
-	}))
-	defer cloudSrv.Close()
-
-	var ollamaHits int32
+	var cloudHits, ollamaHits int32
 	var gotModel string
 	var mu sync.Mutex
-	ollamaSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&ollamaHits, 1)
-		bodyBytes, _ := io.ReadAll(r.Body)
-		var payload map[string]interface{}
-		_ = json.Unmarshal(bodyBytes, &payload)
-		mu.Lock()
-		gotModel, _ = payload["model"].(string)
-		mu.Unlock()
-		w.Header().Set("Content-Type", "application/x-ndjson")
-		_, _ = w.Write([]byte(`{"message":{"role":"assistant","content":"local orbit-thinker reply"},"done":true}` + "\n"))
-	}))
-	defer ollamaSrv.Close()
 
 	sess, err := engine.NewSession(engine.SessionConfig{
-		SessionName:   "local-active-model-hybrid",
-		ActiveModel:   "orbit-thinker:latest",
-		RoutingMode:   "hybrid",
-		OllamaBaseURL: ollamaSrv.URL,
-		CoreMemory:    "<core_memory></core_memory>",
+		SessionName: "local-active-model-hybrid",
+		ActiveModel: "orbit-thinker:latest",
+		RoutingMode: "hybrid",
+		CoreMemory:  "<core_memory></core_memory>",
+		Providers: router.Providers{
+			Cloud: router.ProviderFunc(func(ctx context.Context, model, prompt string, images []string, tools []mcp.Tool, out io.Writer) (*router.GenerateResult, error) {
+				atomic.AddInt32(&cloudHits, 1)
+				return nil, cloud.ErrQuotaExhausted
+			}),
+			Ollama: router.ProviderFunc(func(ctx context.Context, model, prompt string, images []string, tools []mcp.Tool, out io.Writer) (*router.GenerateResult, error) {
+				atomic.AddInt32(&ollamaHits, 1)
+				mu.Lock()
+				gotModel = model
+				mu.Unlock()
+				return &router.GenerateResult{Text: "local orbit-thinker reply"}, nil
+			}),
+		},
 	})
 	if err != nil {
 		t.Fatalf("NewSession failed: %v", err)
 	}
 	defer sess.Close()
-	sess.CloudClient = cloud.NewClient()
-	sess.CloudClient.APIKey = "test-key"
-	sess.CloudClient.BaseURL = cloudSrv.URL
 
 	resp, err := sess.ExecuteTurn(context.Background(), "architect and refactor this service", nil, ioDiscard{})
 	if err != nil {
@@ -835,31 +739,27 @@ func TestTurn_NoSpuriousAutoToolWithoutPlaceholder(t *testing.T) {
 	})
 
 	var ollamaHits int32
-	ollamaSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		hit := atomic.AddInt32(&ollamaHits, 1)
-		w.Header().Set("Content-Type", "application/x-ndjson")
-		if hit == 1 {
-			_, _ = w.Write([]byte(`{"message":{"role":"assistant","content":"Hello! How can I help you today?"},"done":true}` + "\n"))
-			return
-		}
-		_, _ = w.Write([]byte(`{"message":{"role":"assistant","content":"Done."},"done":true}` + "\n"))
-	}))
-	defer ollamaSrv.Close()
-
 	sess, err := engine.NewSession(engine.SessionConfig{
-		SessionName:   "no-spurious-autotool",
-		ActiveModel:   "gemma4:e2b",
-		RoutingMode:   "local-only",
-		OllamaBaseURL: ollamaSrv.URL,
-		Registry:      reg,
-		CoreMemory:    "<core_memory></core_memory>",
+		SessionName: "no-spurious-autotool",
+		ActiveModel: "gemma4:e2b",
+		RoutingMode: "local-only",
+		Registry:    reg,
+		CoreMemory:  "<core_memory></core_memory>",
+		Providers: router.Providers{
+			Ollama: router.ProviderFunc(func(ctx context.Context, model, prompt string, images []string, tools []mcp.Tool, out io.Writer) (*router.GenerateResult, error) {
+				hit := atomic.AddInt32(&ollamaHits, 1)
+				if hit == 1 {
+					return &router.GenerateResult{Text: "Hello! How can I help you today?"}, nil
+				}
+				return &router.GenerateResult{Text: "Done."}, nil
+			}),
+		},
 	})
 	if err != nil {
 		t.Fatalf("NewSession failed: %v", err)
 	}
 	defer sess.Close()
 
-	// Even if prompt contains "search" or "today", normal non-placeholder output must NOT auto-run tools.
 	resp, err := sess.ExecuteTurn(context.Background(), "search today hello", nil, ioDiscard{})
 	if err != nil {
 		t.Fatalf("ExecuteTurn failed: %v", err)
@@ -873,4 +773,167 @@ func TestTurn_NoSpuriousAutoToolWithoutPlaceholder(t *testing.T) {
 	if atomic.LoadInt32(&ollamaHits) != 1 {
 		t.Fatalf("expected single LLM pass without re-execution, got %d", ollamaHits)
 	}
+}
+
+func TestExecuteTurn_MemoryRecallPersistenceAndSingleVisionPass(t *testing.T) {
+	isolateEngineTestEnv(t)
+
+	t.Run("nil MemoryStore is a clean no-op", func(t *testing.T) {
+		var seenPrompt string
+		sess, err := engine.NewSession(engine.SessionConfig{
+			SessionName: "nil-mem-test",
+			RoutingMode: "local-only",
+			CoreMemory:  "<core_memory></core_memory>",
+			MemoryStore: nil,
+			Providers: router.Providers{
+				Ollama: router.ProviderFunc(func(ctx context.Context, model, prompt string, images []string, tools []mcp.Tool, out io.Writer) (*router.GenerateResult, error) {
+					seenPrompt = prompt
+					return &router.GenerateResult{Text: "ok without memory"}, nil
+				}),
+			},
+		})
+		if err != nil {
+			t.Fatalf("NewSession failed: %v", err)
+		}
+		defer sess.Close()
+
+		resp, err := sess.ExecuteTurn(context.Background(), "deploy microgravity kubernetes cluster checklist", nil, ioDiscard{})
+		if err != nil {
+			t.Fatalf("ExecuteTurn failed: %v", err)
+		}
+		if resp != "ok without memory" {
+			t.Fatalf("got %q, want 'ok without memory'", resp)
+		}
+		if strings.Contains(seenPrompt, "[Relevant context from past sessions]") {
+			t.Fatalf("expected no memory injection when MemoryStore == nil")
+		}
+	})
+
+	t.Run("stores completed turn and recalls relevant context in subsequent session", func(t *testing.T) {
+		dbPath := filepath.Join(t.TempDir(), "memory.db")
+		store, err := memory.NewMemoryStore(dbPath)
+		if err != nil {
+			t.Fatalf("NewMemoryStore failed: %v", err)
+		}
+		defer store.Close()
+
+		// Session 1: persist a domain-specific turn via ExecuteTurn
+		sess1, err := engine.NewSession(engine.SessionConfig{
+			SessionName: "sess-1",
+			RoutingMode: "local-only",
+			CoreMemory:  "<core_memory></core_memory>",
+			MemoryStore: store,
+			Providers: router.Providers{
+				Ollama: router.ProviderFunc(func(ctx context.Context, model, prompt string, images []string, tools []mcp.Tool, out io.Writer) (*router.GenerateResult, error) {
+					return &router.GenerateResult{Text: "Use PostgreSQL port 5439 with scram-sha-256 authentication for billing."}, nil
+				}),
+			},
+		})
+		if err != nil {
+			t.Fatalf("NewSession 1 failed: %v", err)
+		}
+		defer sess1.Close()
+
+		_, err = sess1.ExecuteTurn(context.Background(), "Configure PostgreSQL billing database authentication port", nil, ioDiscard{})
+		if err != nil {
+			t.Fatalf("Session 1 ExecuteTurn failed: %v", err)
+		}
+
+		// Session 2: a fresh session querying the same topic must receive recalled memory context
+		var recalledPrompt string
+		sess2, err := engine.NewSession(engine.SessionConfig{
+			SessionName: "sess-2",
+			RoutingMode: "local-only",
+			CoreMemory:  "<core_memory></core_memory>",
+			MemoryStore: store,
+			Providers: router.Providers{
+				Ollama: router.ProviderFunc(func(ctx context.Context, model, prompt string, images []string, tools []mcp.Tool, out io.Writer) (*router.GenerateResult, error) {
+					recalledPrompt = prompt
+					return &router.GenerateResult{Text: "Verified PostgreSQL billing port 5439."}, nil
+				}),
+			},
+		})
+		if err != nil {
+			t.Fatalf("NewSession 2 failed: %v", err)
+		}
+		defer sess2.Close()
+
+		_, err = sess2.ExecuteTurn(context.Background(), "Configure PostgreSQL billing database authentication port", nil, ioDiscard{})
+		if err != nil {
+			t.Fatalf("Session 2 ExecuteTurn failed: %v", err)
+		}
+		if !strings.Contains(recalledPrompt, "[Relevant context from past sessions]") {
+			t.Fatalf("expected recalled memory header in prompt, got:\n%s", recalledPrompt)
+		}
+		if !strings.Contains(recalledPrompt, "5439") && !strings.Contains(recalledPrompt, "PostgreSQL billing database") {
+			t.Fatalf("expected recalled turn content in prompt, got:\n%s", recalledPrompt)
+		}
+
+		// Verify trivial prompt does NOT trigger memory injection
+		var trivialPrompt string
+		sess3, err := engine.NewSession(engine.SessionConfig{
+			SessionName: "sess-3",
+			RoutingMode: "local-only",
+			CoreMemory:  "<core_memory></core_memory>",
+			MemoryStore: store,
+			Providers: router.Providers{
+				Ollama: router.ProviderFunc(func(ctx context.Context, model, prompt string, images []string, tools []mcp.Tool, out io.Writer) (*router.GenerateResult, error) {
+					trivialPrompt = prompt
+					return &router.GenerateResult{Text: "hello"}, nil
+				}),
+			},
+		})
+		if err != nil {
+			t.Fatalf("NewSession 3 failed: %v", err)
+		}
+		defer sess3.Close()
+
+		_, err = sess3.ExecuteTurn(context.Background(), "hi", nil, ioDiscard{})
+		if err != nil {
+			t.Fatalf("Session 3 ExecuteTurn failed: %v", err)
+		}
+		if strings.Contains(trivialPrompt, "[Relevant context from past sessions]") {
+			t.Fatalf("expected no memory injection for trivial prompt 'hi', got:\n%s", trivialPrompt)
+		}
+	})
+
+	t.Run("single vision.ExtractImages pass forwards extracted image to Provider", func(t *testing.T) {
+		imgPath := filepath.Join(t.TempDir(), "sample.png")
+		if err := os.WriteFile(imgPath, []byte("fake-png-bytes"), 0644); err != nil {
+			t.Fatalf("write temp image: %v", err)
+		}
+
+		var gotImages []string
+		var gotPrompt string
+		sess, err := engine.NewSession(engine.SessionConfig{
+			SessionName: "vision-pass-test",
+			RoutingMode: "local-only",
+			CoreMemory:  "<core_memory></core_memory>",
+			Providers: router.Providers{
+				Ollama: router.ProviderFunc(func(ctx context.Context, model, prompt string, images []string, tools []mcp.Tool, out io.Writer) (*router.GenerateResult, error) {
+					gotImages = append([]string(nil), images...)
+					gotPrompt = prompt
+					return &router.GenerateResult{Text: "image analyzed"}, nil
+				}),
+			},
+		})
+		if err != nil {
+			t.Fatalf("NewSession failed: %v", err)
+		}
+		defer sess.Close()
+
+		resp, err := sess.ExecuteTurn(context.Background(), fmt.Sprintf("Inspect %q carefully", imgPath), nil, ioDiscard{})
+		if err != nil {
+			t.Fatalf("ExecuteTurn failed: %v", err)
+		}
+		if resp != "image analyzed" {
+			t.Fatalf("got %q, want 'image analyzed'", resp)
+		}
+		if len(gotImages) != 1 {
+			t.Fatalf("expected exactly 1 extracted image (single pass), got %d", len(gotImages))
+		}
+		if !strings.Contains(gotPrompt, "[Media (image/png): sample.png]") {
+			t.Fatalf("expected media placeholder in prompt, got:\n%s", gotPrompt)
+		}
+	})
 }
