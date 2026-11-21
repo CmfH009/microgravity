@@ -8,11 +8,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/docker/docker/client"
+	"github.com/moby/moby/client"
 )
 
 func skipIfNoDocker(t *testing.T) {
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	cli, err := client.New(client.FromEnv)
 	if err != nil {
 		t.Skipf("Skipping test: docker client creation failed: %v", err)
 	}
@@ -21,7 +21,7 @@ func skipIfNoDocker(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	if _, err = cli.Ping(ctx); err != nil {
+	if _, err = cli.Ping(ctx, client.PingOptions{}); err != nil {
 		t.Skipf("Skipping test: docker daemon not available: %v", err)
 	}
 }

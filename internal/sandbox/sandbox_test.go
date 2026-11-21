@@ -5,20 +5,35 @@ package sandbox
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"io"
+	"iter"
 	"reflect"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/network"
-	"github.com/docker/docker/pkg/stdcopy"
+	"github.com/moby/moby/api/pkg/stdcopy"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/jsonstream"
+	"github.com/moby/moby/api/types/network"
+	"github.com/moby/moby/client"
 	specs "github.com/opencontainers/image-spec/specs-go/v1"
 )
+
+type fakeImagePullResponse struct {
+	io.ReadCloser
+}
+
+func (r fakeImagePullResponse) JSONMessages(context.Context) iter.Seq2[jsonstream.Message, error] {
+	return func(func(jsonstream.Message, error) bool) {}
+}
+
+func (r fakeImagePullResponse) Wait(context.Context) error {
+	return nil
+}
 
 type fakeDockerClient struct {
 	mu sync.Mutex
@@ -27,16 +42,16 @@ type fakeDockerClient struct {
 	stdout      string
 	stderr      string
 
-	pullFn    func(ctx context.Context, refStr string, options types.ImagePullOptions) (io.ReadCloser, error)
+	pullFn    func(ctx context.Context, refStr string, options client.ImagePullOptions) (client.ImagePullResponse, error)
 	createErr error
 	startErr  error
-	waitFn    func(ctx context.Context, containerID string, condition container.WaitCondition) (<-chan container.ContainerWaitOKBody, <-chan error)
-	logsFn    func(ctx context.Context, container string, options types.ContainerLogsOptions) (io.ReadCloser, error)
+	waitFn    func(ctx context.Context, containerID string, options client.ContainerWaitOptions) client.ContainerWaitResult
+	logsFn    func(ctx context.Context, containerID string, options client.ContainerLogsOptions) (client.ContainerLogsResult, error)
 	removeErr error
 	closeErr  error
 
 	pulledImage       string
-	pullOpts          types.ImagePullOptions
+	pullOpts          client.ImagePullOptions
 	createdConfig     *container.Config
 	createdHostConfig *container.HostConfig
 	createdNetConfig  *network.NetworkingConfig
@@ -46,32 +61,41 @@ type fakeDockerClient struct {
 	waitedID          string
 	waitedCond        container.WaitCondition
 	logsID            string
-	logsOpts          types.ContainerLogsOptions
+	logsOpts          client.ContainerLogsOptions
 	removedID         string
-	removedOpts       types.ContainerRemoveOptions
+	removedOpts       client.ContainerRemoveOptions
 	removeCalls       int
 	closed            bool
+}
+
+func writeStdFrame(dst *bytes.Buffer, stream stdcopy.StdType, msg string) error {
+	var hdr [8]byte
+	hdr[0] = byte(stream)
+	binary.BigEndian.PutUint32(hdr[4:8], uint32(len(msg)))
+	if _, err := dst.Write(hdr[:]); err != nil {
+		return err
+	}
+	_, err := dst.WriteString(msg)
+	return err
 }
 
 func frameDockerStreams(t *testing.T, stdout, stderr string) io.ReadCloser {
 	t.Helper()
 	var buf bytes.Buffer
 	if stdout != "" {
-		w := stdcopy.NewStdWriter(&buf, stdcopy.Stdout)
-		if _, err := io.WriteString(w, stdout); err != nil {
+		if err := writeStdFrame(&buf, stdcopy.Stdout, stdout); err != nil {
 			t.Fatalf("failed to frame stdout: %v", err)
 		}
 	}
 	if stderr != "" {
-		w := stdcopy.NewStdWriter(&buf, stdcopy.Stderr)
-		if _, err := io.WriteString(w, stderr); err != nil {
+		if err := writeStdFrame(&buf, stdcopy.Stderr, stderr); err != nil {
 			t.Fatalf("failed to frame stderr: %v", err)
 		}
 	}
 	return io.NopCloser(&buf)
 }
 
-func (f *fakeDockerClient) ImagePull(ctx context.Context, refStr string, options types.ImagePullOptions) (io.ReadCloser, error) {
+func (f *fakeDockerClient) ImagePull(ctx context.Context, refStr string, options client.ImagePullOptions) (client.ImagePullResponse, error) {
 	f.mu.Lock()
 	f.pulledImage = refStr
 	f.pullOpts = options
@@ -81,54 +105,54 @@ func (f *fakeDockerClient) ImagePull(ctx context.Context, refStr string, options
 	if fn != nil {
 		return fn(ctx, refStr, options)
 	}
-	return io.NopCloser(strings.NewReader(`{"status":"Pull complete"}`)), nil
+	return fakeImagePullResponse{io.NopCloser(strings.NewReader(`{"status":"Pull complete"}`))}, nil
 }
 
-func (f *fakeDockerClient) ContainerCreate(_ context.Context, config *container.Config, hostConfig *container.HostConfig, networkingConfig *network.NetworkingConfig, platform *specs.Platform, containerName string) (container.ContainerCreateCreatedBody, error) {
+func (f *fakeDockerClient) ContainerCreate(_ context.Context, options client.ContainerCreateOptions) (client.ContainerCreateResult, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	f.createdConfig = config
-	f.createdHostConfig = hostConfig
-	f.createdNetConfig = networkingConfig
-	f.createdPlatform = platform
-	f.createdName = containerName
+	f.createdConfig = options.Config
+	f.createdHostConfig = options.HostConfig
+	f.createdNetConfig = options.NetworkingConfig
+	f.createdPlatform = options.Platform
+	f.createdName = options.Name
 
 	if f.createErr != nil {
-		return container.ContainerCreateCreatedBody{}, f.createErr
+		return client.ContainerCreateResult{}, f.createErr
 	}
 	id := f.containerID
 	if id == "" {
 		id = "fake-container-id"
 	}
-	return container.ContainerCreateCreatedBody{ID: id}, nil
+	return client.ContainerCreateResult{ID: id}, nil
 }
 
-func (f *fakeDockerClient) ContainerStart(_ context.Context, containerID string, _ types.ContainerStartOptions) error {
+func (f *fakeDockerClient) ContainerStart(_ context.Context, containerID string, _ client.ContainerStartOptions) (client.ContainerStartResult, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.startedID = containerID
-	return f.startErr
+	return client.ContainerStartResult{}, f.startErr
 }
 
-func (f *fakeDockerClient) ContainerWait(ctx context.Context, containerID string, condition container.WaitCondition) (<-chan container.ContainerWaitOKBody, <-chan error) {
+func (f *fakeDockerClient) ContainerWait(ctx context.Context, containerID string, options client.ContainerWaitOptions) client.ContainerWaitResult {
 	f.mu.Lock()
 	f.waitedID = containerID
-	f.waitedCond = condition
+	f.waitedCond = options.Condition
 	fn := f.waitFn
 	f.mu.Unlock()
 
 	if fn != nil {
-		return fn(ctx, containerID, condition)
+		return fn(ctx, containerID, options)
 	}
 
-	statusCh := make(chan container.ContainerWaitOKBody, 1)
+	statusCh := make(chan container.WaitResponse, 1)
 	errCh := make(chan error, 1)
-	statusCh <- container.ContainerWaitOKBody{StatusCode: 0}
-	return statusCh, errCh
+	statusCh <- container.WaitResponse{StatusCode: 0}
+	return client.ContainerWaitResult{Result: statusCh, Error: errCh}
 }
 
-func (f *fakeDockerClient) ContainerLogs(_ context.Context, containerID string, options types.ContainerLogsOptions) (io.ReadCloser, error) {
+func (f *fakeDockerClient) ContainerLogs(_ context.Context, containerID string, options client.ContainerLogsOptions) (client.ContainerLogsResult, error) {
 	f.mu.Lock()
 	f.logsID = containerID
 	f.logsOpts = options
@@ -143,21 +167,21 @@ func (f *fakeDockerClient) ContainerLogs(_ context.Context, containerID string, 
 
 	var buf bytes.Buffer
 	if stdout != "" {
-		_, _ = io.WriteString(stdcopy.NewStdWriter(&buf, stdcopy.Stdout), stdout)
+		_ = writeStdFrame(&buf, stdcopy.Stdout, stdout)
 	}
 	if stderr != "" {
-		_, _ = io.WriteString(stdcopy.NewStdWriter(&buf, stdcopy.Stderr), stderr)
+		_ = writeStdFrame(&buf, stdcopy.Stderr, stderr)
 	}
 	return io.NopCloser(&buf), nil
 }
 
-func (f *fakeDockerClient) ContainerRemove(_ context.Context, containerID string, options types.ContainerRemoveOptions) error {
+func (f *fakeDockerClient) ContainerRemove(_ context.Context, containerID string, options client.ContainerRemoveOptions) (client.ContainerRemoveResult, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.removedID = containerID
 	f.removedOpts = options
 	f.removeCalls++
-	return f.removeErr
+	return client.ContainerRemoveResult{}, f.removeErr
 }
 
 func (f *fakeDockerClient) Close() error {
@@ -186,7 +210,7 @@ func withNewDockerClient(t *testing.T, fn func() (dockerClient, error)) {
 func TestRunPython_Success(t *testing.T) {
 	fake := &fakeDockerClient{
 		containerID: "py-ctr-1",
-		logsFn: func(_ context.Context, _ string, _ types.ContainerLogsOptions) (io.ReadCloser, error) {
+		logsFn: func(_ context.Context, _ string, _ client.ContainerLogsOptions) (client.ContainerLogsResult, error) {
 			return frameDockerStreams(t, "hello from python\n", ""), nil
 		},
 	}
@@ -239,7 +263,7 @@ func TestRunPython_Success(t *testing.T) {
 func TestRunNodeJS_Success(t *testing.T) {
 	fake := &fakeDockerClient{
 		containerID: "node-ctr-1",
-		logsFn: func(_ context.Context, _ string, _ types.ContainerLogsOptions) (io.ReadCloser, error) {
+		logsFn: func(_ context.Context, _ string, _ client.ContainerLogsOptions) (client.ContainerLogsResult, error) {
 			return frameDockerStreams(t, "hello from nodejs\n", ""), nil
 		},
 	}
@@ -277,7 +301,7 @@ func TestRunNodeJS_Success(t *testing.T) {
 func TestRunPython_SyntaxError(t *testing.T) {
 	fake := &fakeDockerClient{
 		containerID: "py-syntax-1",
-		logsFn: func(_ context.Context, _ string, _ types.ContainerLogsOptions) (io.ReadCloser, error) {
+		logsFn: func(_ context.Context, _ string, _ client.ContainerLogsOptions) (client.ContainerLogsResult, error) {
 			return frameDockerStreams(t, "", "  File \"<string>\", line 1\nSyntaxError: '(' was never closed\n"), nil
 		},
 	}
@@ -295,9 +319,12 @@ func TestRunPython_SyntaxError(t *testing.T) {
 func TestRunPython_Timeout(t *testing.T) {
 	fake := &fakeDockerClient{
 		containerID: "py-timeout-1",
-		waitFn: func(_ context.Context, _ string, _ container.WaitCondition) (<-chan container.ContainerWaitOKBody, <-chan error) {
+		waitFn: func(_ context.Context, _ string, _ client.ContainerWaitOptions) client.ContainerWaitResult {
 			// Leave channels open without sending so runInContainer hits ctx.Done().
-			return make(chan container.ContainerWaitOKBody), make(chan error)
+			return client.ContainerWaitResult{
+				Result: make(chan container.WaitResponse),
+				Error:  make(chan error),
+			}
 		},
 	}
 	withFakeDockerClient(t, fake)
@@ -326,7 +353,7 @@ func TestRunPython_Timeout(t *testing.T) {
 func TestRunNodeJS_NoNetwork(t *testing.T) {
 	fake := &fakeDockerClient{
 		containerID: "node-nonet-1",
-		logsFn: func(_ context.Context, _ string, _ types.ContainerLogsOptions) (io.ReadCloser, error) {
+		logsFn: func(_ context.Context, _ string, _ client.ContainerLogsOptions) (client.ContainerLogsResult, error) {
 			return frameDockerStreams(t, "", "connect ENETUNREACH 93.184.216.34:80\n"), nil
 		},
 	}
@@ -350,7 +377,7 @@ func TestRunNodeJS_NoNetwork(t *testing.T) {
 func TestRunInContainer_CombinedStdoutStderr(t *testing.T) {
 	fake := &fakeDockerClient{
 		containerID: "both-streams-1",
-		logsFn: func(_ context.Context, _ string, _ types.ContainerLogsOptions) (io.ReadCloser, error) {
+		logsFn: func(_ context.Context, _ string, _ client.ContainerLogsOptions) (client.ContainerLogsResult, error) {
 			return frameDockerStreams(t, "stdout line", "stderr line"), nil
 		},
 	}
@@ -379,7 +406,7 @@ func TestRunInContainer_ErrorPaths(t *testing.T) {
 
 	t.Run("image pull cancelled", func(t *testing.T) {
 		fake := &fakeDockerClient{
-			pullFn: func(_ context.Context, _ string, _ types.ImagePullOptions) (io.ReadCloser, error) {
+			pullFn: func(_ context.Context, _ string, _ client.ImagePullOptions) (client.ImagePullResponse, error) {
 				return nil, context.Canceled
 			},
 		}
@@ -397,7 +424,7 @@ func TestRunInContainer_ErrorPaths(t *testing.T) {
 
 	t.Run("image pull deadline exceeded", func(t *testing.T) {
 		fake := &fakeDockerClient{
-			pullFn: func(_ context.Context, _ string, _ types.ImagePullOptions) (io.ReadCloser, error) {
+			pullFn: func(_ context.Context, _ string, _ client.ImagePullOptions) (client.ImagePullResponse, error) {
 				return nil, context.DeadlineExceeded
 			},
 		}
@@ -410,10 +437,10 @@ func TestRunInContainer_ErrorPaths(t *testing.T) {
 
 	t.Run("image pull offline falls back to cached image", func(t *testing.T) {
 		fake := &fakeDockerClient{
-			pullFn: func(_ context.Context, _ string, _ types.ImagePullOptions) (io.ReadCloser, error) {
+			pullFn: func(_ context.Context, _ string, _ client.ImagePullOptions) (client.ImagePullResponse, error) {
 				return nil, errors.New("registry offline")
 			},
-			logsFn: func(_ context.Context, _ string, _ types.ContainerLogsOptions) (io.ReadCloser, error) {
+			logsFn: func(_ context.Context, _ string, _ client.ContainerLogsOptions) (client.ContainerLogsResult, error) {
 				return frameDockerStreams(t, "cached-ok\n", ""), nil
 			},
 		}
@@ -466,11 +493,11 @@ func TestRunInContainer_ErrorPaths(t *testing.T) {
 	t.Run("container wait error", func(t *testing.T) {
 		fake := &fakeDockerClient{
 			containerID: "wait-err-ctr",
-			waitFn: func(_ context.Context, _ string, _ container.WaitCondition) (<-chan container.ContainerWaitOKBody, <-chan error) {
-				statusCh := make(chan container.ContainerWaitOKBody)
+			waitFn: func(_ context.Context, _ string, _ client.ContainerWaitOptions) client.ContainerWaitResult {
+				statusCh := make(chan container.WaitResponse)
 				errCh := make(chan error, 1)
 				errCh <- errors.New("wait stream broken")
-				return statusCh, errCh
+				return client.ContainerWaitResult{Result: statusCh, Error: errCh}
 			},
 		}
 		withFakeDockerClient(t, fake)
@@ -488,7 +515,7 @@ func TestRunInContainer_ErrorPaths(t *testing.T) {
 	t.Run("container logs error", func(t *testing.T) {
 		fake := &fakeDockerClient{
 			containerID: "logs-err-ctr",
-			logsFn: func(_ context.Context, _ string, _ types.ContainerLogsOptions) (io.ReadCloser, error) {
+			logsFn: func(_ context.Context, _ string, _ client.ContainerLogsOptions) (client.ContainerLogsResult, error) {
 				return nil, errors.New("logs unavailable")
 			},
 		}
@@ -507,7 +534,7 @@ func TestRunInContainer_ErrorPaths(t *testing.T) {
 	t.Run("stdcopy demux error on invalid stream header", func(t *testing.T) {
 		fake := &fakeDockerClient{
 			containerID: "bad-frame-ctr",
-			logsFn: func(_ context.Context, _ string, _ types.ContainerLogsOptions) (io.ReadCloser, error) {
+			logsFn: func(_ context.Context, _ string, _ client.ContainerLogsOptions) (client.ContainerLogsResult, error) {
 				// Invalid stream type byte (99) triggers stdcopy.StdCopy unrecognized header error.
 				invalid := []byte{99, 0, 0, 0, 0, 0, 0, 1, 'x'}
 				return io.NopCloser(bytes.NewReader(invalid)), nil
