@@ -2,8 +2,12 @@ package tools
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
+
+	"github.com/CmfH009/microgravity/internal/sidecar"
 )
 
 func TestBrowserToolsRegistration(t *testing.T) {
@@ -99,4 +103,84 @@ func TestBrowserToolsExecution(t *testing.T) {
 			t.Errorf("unexpected plan output: %s", planOut)
 		}
 	})
+}
+
+func TestBrowserToolsDeterministicWithFakeRunner(t *testing.T) {
+	t.Setenv("PATH", "")
+
+	var lastReq map[string]interface{}
+	var fakeResp map[string]interface{}
+	var fakeErr error
+	var fakeStderr string
+
+	restore := sidecar.SetDefaultRunner(&sidecar.Runner{
+		Command: sidecar.CommandRunnerFunc(func(ctx context.Context, name string, args []string, stdin []byte) ([]byte, []byte, error) {
+			if err := json.Unmarshal(stdin, &lastReq); err != nil {
+				t.Fatalf("invalid stdin JSON: %v", err)
+			}
+			if fakeErr != nil {
+				return nil, []byte(fakeStderr), fakeErr
+			}
+			out, _ := json.Marshal(fakeResp)
+			return out, nil, nil
+		}),
+		FindPython: func() string { return "fake-python" },
+		FindScript: func(relPath, fallbackName string) string { return fallbackName },
+	})
+	defer restore()
+
+	registry := NewRegistry()
+	RegisterBrowserTools(registry)
+	ctx := context.Background()
+
+	// 1. Navigate
+	fakeResp = map[string]interface{}{"status": "ok", "title": "Fake Page", "url": "https://fake.local"}
+	out, err := registry.Execute(ctx, "browser_navigate", map[string]interface{}{
+		"url":     "https://fake.local",
+		"new_tab": true,
+	})
+	if err != nil {
+		t.Fatalf("browser_navigate failed: %v", err)
+	}
+	if lastReq["action"] != "navigate" || lastReq["url"] != "https://fake.local" || lastReq["new_tab"] != true {
+		t.Fatalf("unexpected navigate request: %+v", lastReq)
+	}
+	if !strings.Contains(out, "Fake Page") {
+		t.Fatalf("unexpected navigate output: %s", out)
+	}
+
+	// 2. Extract with markdown formatting
+	fakeResp = map[string]interface{}{
+		"status":   "ok",
+		"title":    "Docs",
+		"url":      "https://fake.local/docs",
+		"markdown": "## Heading\nBody text",
+	}
+	extOut, err := registry.Execute(ctx, "browser_extract", map[string]interface{}{
+		"url": "https://fake.local/docs",
+	})
+	if err != nil {
+		t.Fatalf("browser_extract failed: %v", err)
+	}
+	if !strings.Contains(extOut, "# Docs\nURL: https://fake.local/docs\n\n## Heading") {
+		t.Fatalf("unexpected markdown extract output: %s", extOut)
+	}
+
+	// 3. Sidecar status=="error" unpacking
+	fakeResp = map[string]interface{}{"status": "error", "error": "element not clickable"}
+	_, err = registry.Execute(ctx, "browser_interact", map[string]interface{}{
+		"action":   "click",
+		"selector": "#missing",
+	})
+	if err == nil || !strings.Contains(err.Error(), "element not clickable") {
+		t.Fatalf("expected unpacked sidecar error, got %v", err)
+	}
+
+	// 4. Process error with stderr capture
+	fakeErr = errors.New("exit status 2")
+	fakeStderr = "browser crash trace"
+	_, err = RunBrowserTool(ctx, map[string]interface{}{"action": "navigate", "url": "https://fake.local"})
+	if err == nil || !strings.Contains(err.Error(), "browser crash trace") {
+		t.Fatalf("expected stderr in error, got %v", err)
+	}
 }

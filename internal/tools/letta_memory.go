@@ -1,17 +1,19 @@
 package tools
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"os/exec"
 	"path/filepath"
 	"strings"
 
 	"github.com/CmfH009/microgravity/internal/mcp"
 	"github.com/CmfH009/microgravity/internal/sidecar"
 )
+
+var lettaMemoryScriptRelPath = filepath.Join("letta", "mg_memory_letta.py")
+
+const lettaMemoryScriptFallback = "mg_memory_letta.py"
 
 // RegisterLettaMemoryTools registers Letta-style hierarchical and episodic memory tools.
 func RegisterLettaMemoryTools(r *Registry) {
@@ -258,46 +260,14 @@ func RegisterLettaMemoryTools(r *Registry) {
 	})
 }
 
-// RunLettaMemory sends a JSON request to mg_memory_letta.py and parses the JSON response.
+// RunLettaMemory sends a JSON request to mg_memory_letta.py via the shared sidecar runner.
 func RunLettaMemory(ctx context.Context, req map[string]interface{}) (map[string]interface{}, error) {
-	scriptPath := FindLettaMemoryScript()
-	python := sidecar.FindPython()
-
-	reqBytes, err := json.Marshal(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal Letta memory request: %w", err)
-	}
-
-	cmd := exec.CommandContext(ctx, python, scriptPath)
-	cmd.Stdin = bytes.NewReader(reqBytes)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		stderrStr := stderr.String()
-		if stderrStr != "" {
-			return nil, fmt.Errorf("Letta memory script failed: %v\nstderr: %s", err, stderrStr)
-		}
-		return nil, fmt.Errorf("Letta memory script failed: %v", err)
-	}
-
-	var result map[string]interface{}
-	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
-		return nil, fmt.Errorf("failed to parse Letta memory output: %v\nraw: %s", err, stdout.String())
-	}
-
-	if status, ok := result["status"].(string); ok && status == "error" {
-		errMsg, _ := result["error"].(string)
-		return nil, fmt.Errorf("Letta memory error: %s", errMsg)
-	}
-
-	return result, nil
+	return sidecar.Invoke(ctx, lettaMemoryScriptRelPath, lettaMemoryScriptFallback, req)
 }
 
 // FindLettaMemoryScript locates mg_memory_letta.py using the dynamic sidecar locator.
 func FindLettaMemoryScript() string {
-	return sidecar.FindScript(filepath.Join("letta", "mg_memory_letta.py"), "mg_memory_letta.py")
+	return sidecar.FindScript(lettaMemoryScriptRelPath, lettaMemoryScriptFallback)
 }
 
 // GetCompiledLettaMemory retrieves the compiled XML core memory block (<core_memory>...</core_memory>)

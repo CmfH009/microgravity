@@ -1,17 +1,19 @@
 package tools
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"os/exec"
 	"path/filepath"
 	"strings"
 
 	"github.com/CmfH009/microgravity/internal/mcp"
 	"github.com/CmfH009/microgravity/internal/sidecar"
 )
+
+var browserScriptRelPath = filepath.Join("browser", "mg_tool_browser.py")
+
+const browserScriptFallback = "mg_tool_browser.py"
 
 // RegisterBrowserTools registers Browser-Use action tools to the native registry.
 func RegisterBrowserTools(r *Registry) {
@@ -281,44 +283,12 @@ func RegisterBrowserTools(r *Registry) {
 	})
 }
 
-// RunBrowserTool sends a JSON request to mg_tool_browser.py and parses the response.
+// RunBrowserTool sends a JSON request to mg_tool_browser.py via the shared sidecar runner.
 func RunBrowserTool(ctx context.Context, req map[string]interface{}) (map[string]interface{}, error) {
-	scriptPath := FindBrowserToolScript()
-	python := sidecar.FindPython()
-
-	reqBytes, err := json.Marshal(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal browser request: %w", err)
-	}
-
-	cmd := exec.CommandContext(ctx, python, scriptPath)
-	cmd.Stdin = bytes.NewReader(reqBytes)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		stderrStr := stderr.String()
-		if stderrStr != "" {
-			return nil, fmt.Errorf("browser tool script failed: %v\nstderr: %s", err, stderrStr)
-		}
-		return nil, fmt.Errorf("browser tool script failed: %v", err)
-	}
-
-	var result map[string]interface{}
-	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
-		return nil, fmt.Errorf("failed to parse browser tool output: %v\nraw: %s", err, stdout.String())
-	}
-
-	if status, ok := result["status"].(string); ok && status == "error" {
-		errMsg, _ := result["error"].(string)
-		return nil, fmt.Errorf("browser error: %s", errMsg)
-	}
-
-	return result, nil
+	return sidecar.Invoke(ctx, browserScriptRelPath, browserScriptFallback, req)
 }
 
 // FindBrowserToolScript locates mg_tool_browser.py using the dynamic sidecar locator.
 func FindBrowserToolScript() string {
-	return sidecar.FindScript(filepath.Join("browser", "mg_tool_browser.py"), "mg_tool_browser.py")
+	return sidecar.FindScript(browserScriptRelPath, browserScriptFallback)
 }

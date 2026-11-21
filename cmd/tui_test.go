@@ -14,6 +14,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/CmfH009/microgravity/internal/config"
 	"github.com/CmfH009/microgravity/internal/engine"
 	"github.com/CmfH009/microgravity/internal/subagent"
 	"github.com/CmfH009/microgravity/internal/ui"
@@ -308,6 +309,7 @@ func TestTUI_UpgradedStatusBar(t *testing.T) {
 }
 
 func TestTUI_ThemeSwitcherAndPicker(t *testing.T) {
+	isolateCmdTestEnv(t)
 	t.Cleanup(func() {
 		lipgloss.SetHasDarkBackground(true)
 		ui.SetTheme("dark")
@@ -317,20 +319,23 @@ func TestTUI_ThemeSwitcherAndPicker(t *testing.T) {
 	m := newModel(sess, context.Background())
 	m.Update(tea.WindowSizeMsg{Width: 100, Height: 24})
 
-	// Direct /theme <name>
+	// Direct /theme <name> updates UI AND persists via config.SetTheme
 	m.handleInput("/theme catppuccin")
 	assert.Equal(t, "catppuccin", m.activeTheme)
 	assert.Equal(t, "catppuccin", ui.ActiveThemeName())
+	assert.Equal(t, "catppuccin", config.GetTheme())
 
 	lipgloss.SetHasDarkBackground(false)
 	m.handleInput("/theme auto")
 	assert.Equal(t, "light", m.activeTheme)
 	assert.Equal(t, "light", ui.ActiveThemeName())
+	assert.Equal(t, "auto", config.GetTheme())
 
-	// Unknown theme reports error without changing active theme
+	// Unknown theme reports error without changing active or persisted theme
 	m.handleInput("/theme nonexistent")
 	require.Error(t, m.err)
 	assert.Equal(t, "light", m.activeTheme)
+	assert.Equal(t, "auto", config.GetTheme())
 
 	// /theme without arguments opens interactive theme picker
 	m.handleInput("/theme")
@@ -345,6 +350,43 @@ func TestTUI_ThemeSwitcherAndPicker(t *testing.T) {
 	assert.False(t, m.showThemePicker)
 	assert.Equal(t, "tokyo-night", ui.ActiveThemeName())
 	assert.Equal(t, "tokyo-night", m.activeTheme)
+	assert.Equal(t, "tokyo-night", config.GetTheme())
+}
+
+func TestTUI_SharedSlashCommands(t *testing.T) {
+	isolateCmdTestEnv(t)
+	sess := newTestTUISession(t, "")
+	m := newModel(sess, context.Background())
+	m.Update(tea.WindowSizeMsg{Width: 100, Height: 24})
+
+	// /local on & /local status now work in TUI via internal/slash
+	m.handleInput("/local on")
+	require.NoError(t, m.err)
+	assert.Equal(t, "local-only", string(sess.GetRoutingMode()))
+	assert.Equal(t, "local-only", config.GetRoutingMode())
+
+	m.handleInput("/local status")
+	require.NoError(t, m.err)
+	require.NotEmpty(t, m.messages)
+	assert.Contains(t, m.messages[len(m.messages)-1].content, "local-only")
+
+	// /caveman ultra & /caveman off now work in TUI
+	m.handleInput("/caveman ultra")
+	require.NoError(t, m.err)
+	assert.Equal(t, "ultra", sess.Config.CavemanLevel)
+	m.handleInput("/caveman off")
+	assert.Equal(t, "off", sess.Config.CavemanLevel)
+
+	// /diff, /mcp, /rules, /learn all handled locally in TUI
+	m.handleInput("/mcp")
+	require.NoError(t, m.err)
+	assert.Contains(t, m.messages[len(m.messages)-1].content, "MCP")
+
+	m.handleInput("/learn Keep tests fast and isolated")
+	require.NoError(t, m.err)
+	rulesBytes, err := os.ReadFile(filepath.Join(sess.Config.Cwd, ".microgravity", "rules.md"))
+	require.NoError(t, err)
+	assert.Contains(t, string(rulesBytes), "Keep tests fast and isolated")
 }
 
 func TestTUI_RewindCheckpointPicker(t *testing.T) {

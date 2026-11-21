@@ -2,8 +2,11 @@ package tools
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
+
+	"github.com/CmfH009/microgravity/internal/sidecar"
 )
 
 func TestLettaMemoryToolsRegistration(t *testing.T) {
@@ -195,4 +198,64 @@ func TestGetCompiledLettaMemory(t *testing.T) {
 		t.Errorf("expected </core_memory> closing tag, got: %s", compiled)
 	}
 }
+
+func TestLettaMemoryDeterministicWithFakeRunner(t *testing.T) {
+	t.Setenv("PATH", "")
+
+	var lastReq map[string]interface{}
+	var fakeResp map[string]interface{}
+
+	restore := sidecar.SetDefaultRunner(&sidecar.Runner{
+		Command: sidecar.CommandRunnerFunc(func(ctx context.Context, name string, args []string, stdin []byte) ([]byte, []byte, error) {
+			if err := json.Unmarshal(stdin, &lastReq); err != nil {
+				t.Fatalf("invalid stdin JSON: %v", err)
+			}
+			out, _ := json.Marshal(fakeResp)
+			return out, nil, nil
+		}),
+		FindPython: func() string { return "fake-python" },
+		FindScript: func(relPath, fallbackName string) string { return fallbackName },
+	})
+	defer restore()
+
+	registry := NewRegistry()
+	RegisterLettaMemoryTools(registry)
+
+	// 1. GetCompiledLettaMemory (including nil ctx safety)
+	fakeResp = map[string]interface{}{
+		"status":   "ok",
+		"compiled": "<core_memory><human>Alice</human></core_memory>",
+	}
+	got := GetCompiledLettaMemory(nil)
+	if got != "<core_memory><human>Alice</human></core_memory>" {
+		t.Fatalf("GetCompiledLettaMemory(nil) = %q", got)
+	}
+	if lastReq["op"] != "core_compile" {
+		t.Fatalf("expected op=core_compile, got %+v", lastReq)
+	}
+
+	// 2. GetCompiledLettaMemory returns empty string on sidecar error
+	fakeResp = map[string]interface{}{
+		"status": "error",
+		"error":  "database locked",
+	}
+	if gotErr := GetCompiledLettaMemory(context.Background()); gotErr != "" {
+		t.Fatalf("expected empty string on error, got %q", gotErr)
+	}
+
+	// 3. Episodic and archival tool framing
+	fakeResp = map[string]interface{}{"status": "ok", "count": 1}
+	_, err := registry.Execute(context.Background(), "letta_memory_episodic", map[string]interface{}{
+		"op":      "log",
+		"role":    "user",
+		"content": "hello",
+	})
+	if err != nil {
+		t.Fatalf("letta_memory_episodic failed: %v", err)
+	}
+	if lastReq["op"] != "episodic_log" || lastReq["content"] != "hello" {
+		t.Fatalf("unexpected episodic request: %+v", lastReq)
+	}
+}
+
 

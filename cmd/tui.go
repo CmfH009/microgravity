@@ -8,7 +8,6 @@ import (
 	"os/exec"
 	"os/signal"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -20,9 +19,10 @@ import (
 	"github.com/CmfH009/microgravity/internal/engine"
 	"github.com/CmfH009/microgravity/internal/history"
 	"github.com/CmfH009/microgravity/internal/lock"
-	"github.com/CmfH009/microgravity/internal/memory"
 	"github.com/CmfH009/microgravity/internal/ollama"
 	"github.com/CmfH009/microgravity/internal/pruner"
+	"github.com/CmfH009/microgravity/internal/router"
+	"github.com/CmfH009/microgravity/internal/slash"
 	"github.com/CmfH009/microgravity/internal/subagent"
 	"github.com/CmfH009/microgravity/internal/ui"
 	"github.com/CmfH009/microgravity/internal/updater"
@@ -82,16 +82,6 @@ type approvalRequestMsg struct {
 
 // tickMsg drives animations and live swarm elapsed updates.
 type tickMsg time.Time
-
-type checkpointItem struct {
-	id        string
-	turn      int
-	commitSHA string
-	shortSHA  string
-	message   string
-	when      string
-	diffStat  string
-}
 
 var tuiSpinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
@@ -209,11 +199,12 @@ type model struct {
 	showThemePicker      bool
 	themeCursor          int
 	showRewindPicker     bool
-	checkpoints          []checkpointItem
+	checkpoints          []slash.CheckpointItem
 	rewindCursor         int
 	pendingApproval      *approvalRequestMsg
 	alwaysAllowTools     map[string]bool
 	lastApprovalDecision ApprovalDecision
+	slashHandler         *slash.Handler
 }
 
 // newModel creates a TUI model wrapping an engine session.
@@ -232,6 +223,7 @@ func newModel(sess *engine.Session, ctx context.Context) *model {
 		toolsExpanded:    false,
 		activeTheme:      ui.ActiveThemeName(),
 		alwaysAllowTools: make(map[string]bool),
+		slashHandler:     newSlashHandler(sess, nil, true),
 	}
 	if sess != nil {
 		m.status = sess.GetState()
@@ -459,7 +451,7 @@ func (m *model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	// 3. Interactive theme picker overlay.
 	if m.showThemePicker {
-		options := themePickerOptions()
+		options := slash.SupportedThemes()
 		switch key {
 		case "esc", "q":
 			m.showThemePicker = false
@@ -477,15 +469,20 @@ func (m *model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "enter":
 			if m.themeCursor >= 0 && m.themeCursor < len(options) {
 				chosen := options[m.themeCursor]
-				ui.SetTheme(chosen)
-				m.activeTheme = ui.ActiveThemeName()
-				m.messages = append(m.messages, uiRenderable{
-					role:    engine.RoleSystem,
-					name:    "Theme",
-					content: fmt.Sprintf("Theme switched to %q (active: %s).", chosen, m.activeTheme),
-					ts:      time.Now(),
-				})
-				m.syncScroll()
+				res := m.slash().ApplyTheme(chosen)
+				if res.Err != nil {
+					m.err = res.Err
+				} else {
+					m.err = nil
+					m.activeTheme = ui.ActiveThemeName()
+					m.messages = append(m.messages, uiRenderable{
+						role:    engine.RoleSystem,
+						name:    "Theme",
+						content: fmt.Sprintf("Theme switched to %q (active: %s).", chosen, m.activeTheme),
+						ts:      time.Now(),
+					})
+					m.syncScroll()
+				}
 			}
 			m.showThemePicker = false
 			return m, nil
@@ -693,58 +690,46 @@ func (m *model) deleteAtCursor() {
 	m.input = string(next)
 }
 
-func themePickerOptions() []string {
-	opts := []string{"auto"}
-	opts = append(opts, ui.ThemeNames()...)
-	return opts
-}
-
-func isValidThemeName(name string) bool {
-	n := strings.ToLower(strings.TrimSpace(name))
-	if n == "auto" {
-		return true
+func (m *model) slash() *slash.Handler {
+	if m.slashHandler == nil {
+		m.slashHandler = newSlashHandler(m.sess, nil, true)
 	}
-	for _, t := range ui.ThemeNames() {
-		if t == n {
-			return true
-		}
-	}
-	return false
+	return m.slashHandler
 }
 
 func (m *model) handleInput(text string) (tea.Model, tea.Cmd) {
 	trimmed := strings.TrimSpace(text)
-	lower := strings.ToLower(trimmed)
-	switch {
-	case lower == "/exit" || lower == "/quit":
-		m.quitting = true
-		return m, tea.Quit
-
-	case lower == "/clear":
-		if m.sess != nil {
-			m.sess.ClearHistory()
-			m.turnStartMsgIdx = 0
+	if res := m.slash().Execute(m.ctx, trimmed); res.Handled {
+		if res.Err != nil {
+			m.err = res.Err
+			return m, nil
 		}
-		m.messages = make([]uiRenderable, 0)
-		m.streamingText = ""
 		m.err = nil
-		m.scrollOffset = 0
-		m.autoScroll = true
-		return m, nil
+		m.activeTheme = ui.ActiveThemeName()
 
-	case lower == "/help":
-		m.showHelp = true
-		return m, nil
+		switch res.Action {
+		case slash.ActionExit:
+			m.quitting = true
+			return m, tea.Quit
 
-	case lower == "/theme" || strings.HasPrefix(lower, "/theme "):
-		arg := ""
-		if len(trimmed) > 6 {
-			arg = strings.TrimSpace(trimmed[6:])
-		}
-		if arg == "" {
+		case slash.ActionClear:
+			if m.sess != nil {
+				m.turnStartMsgIdx = 0
+			}
+			m.messages = make([]uiRenderable, 0)
+			m.streamingText = ""
+			m.scrollOffset = 0
+			m.autoScroll = true
+			return m, nil
+
+		case slash.ActionHelp:
+			m.showHelp = true
+			return m, nil
+
+		case slash.ActionOpenThemePicker:
 			m.showThemePicker = true
 			m.themeCursor = 0
-			options := themePickerOptions()
+			options := slash.SupportedThemes()
 			for i, opt := range options {
 				if opt == m.activeTheme {
 					m.themeCursor = i
@@ -752,117 +737,94 @@ func (m *model) handleInput(text string) (tea.Model, tea.Cmd) {
 				}
 			}
 			return m, nil
-		}
-		if !isValidThemeName(arg) {
-			m.err = fmt.Errorf("unknown theme %q (valid: auto, %s)", arg, strings.Join(ui.ThemeNames(), ", "))
+
+		case slash.ActionOpenRewindPicker:
+			m.checkpoints = slash.LoadCheckpoints(m.slash().Sess)
+			m.rewindCursor = 0
+			m.showRewindPicker = true
 			return m, nil
-		}
-		ui.SetTheme(arg)
-		m.activeTheme = ui.ActiveThemeName()
-		m.err = nil
-		m.messages = append(m.messages, uiRenderable{
-			role:    engine.RoleSystem,
-			name:    "Theme",
-			content: fmt.Sprintf("Active theme set to %s.", m.activeTheme),
-			ts:      time.Now(),
-		})
-		m.syncScroll()
-		return m, nil
 
-	case lower == "/swarm" || strings.HasPrefix(lower, "/swarm "):
-		arg := ""
-		if len(trimmed) > 6 {
-			arg = strings.ToLower(strings.TrimSpace(trimmed[6:]))
-		}
-		switch arg {
-		case "on", "open", "show":
-			m.showSwarm = true
-		case "off", "close", "hide":
-			m.showSwarm = false
-		default:
-			m.showSwarm = !m.showSwarm
-		}
-		m.syncScroll()
-		if m.showSwarm && hasRunningSubagents() {
-			return m, tickCmd()
-		}
-		return m, nil
-
-	case lower == "/rewind":
-		m.checkpoints = loadCheckpoints(m.sess)
-		m.rewindCursor = 0
-		m.showRewindPicker = true
-		m.err = nil
-		return m, nil
-
-	case strings.HasPrefix(lower, "/session"):
-		parts := strings.Fields(text)
-		if len(parts) > 1 && m.sess != nil {
-			name := parts[1]
-			m.sess.Config.SessionName = name
-			if err := m.sess.LoadSavedHistory(); err != nil {
-				m.err = err
-				return m, nil
+		case slash.ActionToggleSwarm:
+			switch res.ActionArg {
+			case "on":
+				m.showSwarm = true
+			case "off":
+				m.showSwarm = false
+			default:
+				m.showSwarm = !m.showSwarm
 			}
-			m.messages = make([]uiRenderable, 0)
-			sessMsgs := m.sess.GetMessages()
-			for _, msg := range sessMsgs {
-				m.messages = append(m.messages, messageToRenderable(msg))
-			}
-			m.turnStartMsgIdx = len(sessMsgs)
 			m.syncScroll()
-		}
-		return m, nil
-
-	case strings.HasPrefix(lower, "/undo"):
-		if m.sess == nil {
-			m.err = fmt.Errorf("no active session")
+			if m.showSwarm && hasRunningSubagents() {
+				return m, tickCmd()
+			}
 			return m, nil
+
+		case slash.ActionReloadSession:
+			if m.sess != nil {
+				m.messages = make([]uiRenderable, 0)
+				sessMsgs := m.sess.GetMessages()
+				for _, msg := range sessMsgs {
+					m.messages = append(m.messages, messageToRenderable(msg))
+				}
+				m.turnStartMsgIdx = len(sessMsgs)
+				m.syncScroll()
+			}
+			return m, nil
+
+		case slash.ActionRefreshGit:
+			if res.Output != "" {
+				title := res.Title
+				if title == "" {
+					title = "System Directive"
+				}
+				m.messages = append(m.messages, uiRenderable{
+					role:    engine.RoleSystem,
+					name:    title,
+					content: res.Output,
+					ts:      time.Now(),
+				})
+				m.syncScroll()
+			}
+			return m, refreshGitStatusCmd(m.cwd())
 		}
-		if rewound, err := m.sess.Rewind(); err != nil {
-			m.err = err
+
+		if res.Prompt != "" {
+			text = res.Prompt
 		} else {
-			m.err = nil
-			m.messages = append(m.messages, uiRenderable{
-				role:    engine.RoleSystem,
-				name:    "System Directive",
-				content: fmt.Sprintf("Rewound to checkpoint %s (turn %d)", rewound.ID, rewound.Turn),
-				ts:      time.Now(),
-			})
-			m.syncScroll()
-		}
-		return m, refreshGitStatusCmd(m.cwd())
-
-	case strings.HasPrefix(lower, "/usage"):
-		usedTokens, maxTokens, pct := m.contextUsage()
-		m.messages = append(m.messages, uiRenderable{
-			role:    engine.RoleSystem,
-			name:    "Usage",
-			content: fmt.Sprintf("Context: ~%d / %d tokens (%d%%) • Messages: %d", usedTokens, maxTokens, pct, len(m.messages)),
-			ts:      time.Now(),
-		})
-		m.syncScroll()
-		return m, nil
-
-	default:
-		if m.sess == nil {
-			m.err = fmt.Errorf("session is not initialized")
+			if res.Output != "" {
+				title := res.Title
+				if title == "" {
+					title = "System"
+				}
+				m.messages = append(m.messages, uiRenderable{
+					role:    engine.RoleSystem,
+					name:    title,
+					content: res.Output,
+					ts:      time.Now(),
+				})
+				m.syncScroll()
+			}
 			return m, nil
 		}
-		m.err = nil
-		m.messages = append(m.messages, uiRenderable{
-			role:    engine.RoleUser,
-			content: text,
-			ts:      time.Now(),
-		})
-		m.turnStartMsgIdx = len(m.sess.GetMessages())
-		m.streamingText = ""
-		m.status = engine.StateThinking
-		m.autoScroll = true
-		m.syncScroll()
-		go m.executeTurn(text)
-		return m, tickCmd()
 	}
+
+	if m.sess == nil {
+		m.err = fmt.Errorf("session is not initialized")
+		return m, nil
+	}
+	m.err = nil
+	m.messages = append(m.messages, uiRenderable{
+		role:    engine.RoleUser,
+		content: text,
+		ts:      time.Now(),
+	})
+	m.turnStartMsgIdx = len(m.sess.GetMessages())
+	m.streamingText = ""
+	m.status = engine.StateThinking
+	m.autoScroll = true
+	m.syncScroll()
+	go m.executeTurn(text)
+	return m, tickCmd()
 }
 
 func (m *model) executeTurn(input string) {
@@ -871,40 +833,9 @@ func (m *model) executeTurn(input string) {
 		return
 	}
 
-	rawInput := input
-	promptInput := rawInput
-	memStore := m.sess.Config.MemoryStore
-	if memStore != nil && memory.ShouldInjectMemory(rawInput) {
-		ctxResults, memErr := memStore.RetrieveRelevant(rawInput, 3)
-		ctxResults = memory.FilterRelevant(ctxResults, 0.45)
-		if memErr == nil && len(ctxResults) > 0 {
-			var ctxBuf strings.Builder
-			ctxBuf.WriteString("[Relevant context from past sessions]\n")
-			for _, r := range ctxResults {
-				ctxBuf.WriteString(fmt.Sprintf("  - %s\n", r.Text))
-			}
-			ctxBuf.WriteString("\n")
-			promptInput = ctxBuf.String() + rawInput
-		}
-	}
-
 	sw := newTUIStreamWriter(getTUIProgram())
-	resp, err := m.sess.ExecuteTurn(m.ctx, promptInput, nil, sw)
+	resp, err := m.sess.ExecuteTurn(m.ctx, input, nil, sw)
 	m.sess.SetState(engine.StateIdle)
-
-	if memStore != nil {
-		lastResp := resp
-		if lastResp == "" {
-			msgs := m.sess.GetMessages()
-			if len(msgs) > 0 {
-				lastMsg := msgs[len(msgs)-1]
-				if lastMsg.Role == engine.RoleAssistant {
-					lastResp = lastMsg.Content
-				}
-			}
-		}
-		_ = memStore.StoreTurn(m.sess.Config.SessionName, rawInput, lastResp)
-	}
 
 	sendTUIMsg(turnResultMsg{response: resp, err: err})
 }
@@ -914,20 +845,9 @@ func (m *model) applySelectedCheckpoint() (tea.Model, tea.Cmd) {
 	if len(m.checkpoints) == 0 || m.rewindCursor < 0 || m.rewindCursor >= len(m.checkpoints) {
 		return m, nil
 	}
-	if m.sess == nil || m.sess.CheckpointMgr == nil {
-		m.err = fmt.Errorf("checkpoint manager not initialized")
-		return m, nil
-	}
 
 	selected := m.checkpoints[m.rewindCursor]
-	var restoreErr error
-	if latest, ok := m.sess.CheckpointMgr.Latest(); ok && (latest.CommitSHA == selected.commitSHA || latest.ID == selected.id) {
-		_, restoreErr = m.sess.Rewind()
-	} else {
-		restoreErr = m.sess.CheckpointMgr.RestoreCheckpoint(selected.commitSHA)
-	}
-
-	if restoreErr != nil {
+	if restoreErr := slash.RestoreCheckpoint(m.slash().Sess, selected); restoreErr != nil {
 		m.err = restoreErr
 		return m, nil
 	}
@@ -936,102 +856,11 @@ func (m *model) applySelectedCheckpoint() (tea.Model, tea.Cmd) {
 	m.messages = append(m.messages, uiRenderable{
 		role:    engine.RoleSystem,
 		name:    "Rewind",
-		content: fmt.Sprintf("Restored checkpoint %s (turn %d, %s).", selected.id, selected.turn, selected.shortSHA),
+		content: fmt.Sprintf("Restored checkpoint %s (turn %d, %s).", selected.ID, selected.Turn, selected.ShortSHA),
 		ts:      time.Now(),
 	})
 	m.syncScroll()
 	return m, refreshGitStatusCmd(m.cwd())
-}
-
-func loadCheckpoints(sess *engine.Session) []checkpointItem {
-	var items []checkpointItem
-	seenSHA := make(map[string]bool)
-
-	if sess != nil && sess.Config.Cwd != "" {
-		cmd := exec.Command("git", "for-each-ref", "--sort=-creatordate",
-			"--format=%(refname:short)|%(objectname:short)|%(objectname)|%(creatordate:relative)|%(subject)",
-			"refs/microgravity/checkpoints/")
-		cmd.Dir = sess.Config.Cwd
-		if out, err := cmd.Output(); err == nil {
-			for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-				line = strings.TrimSpace(line)
-				if line == "" {
-					continue
-				}
-				parts := strings.SplitN(line, "|", 5)
-				if len(parts) < 3 {
-					continue
-				}
-				refShort, shortSHA, fullSHA := parts[0], parts[1], parts[2]
-				when := ""
-				subject := ""
-				if len(parts) > 3 {
-					when = parts[3]
-				}
-				if len(parts) > 4 {
-					subject = parts[4]
-				}
-				turn := 0
-				refParts := strings.Split(refShort, "/")
-				if len(refParts) > 0 {
-					if tNum, err := strconv.Atoi(refParts[len(refParts)-1]); err == nil {
-						turn = tNum
-					}
-				}
-				diffStat := gitDiffShortStat(sess.Config.Cwd, fullSHA)
-				items = append(items, checkpointItem{
-					id:        fmt.Sprintf("cp-%d", turn),
-					turn:      turn,
-					commitSHA: fullSHA,
-					shortSHA:  shortSHA,
-					message:   subject,
-					when:      when,
-					diffStat:  diffStat,
-				})
-				seenSHA[fullSHA] = true
-				if len(items) >= 15 {
-					break
-				}
-			}
-		}
-	}
-
-	if sess != nil && sess.CheckpointMgr != nil {
-		if latest, ok := sess.CheckpointMgr.Latest(); ok && !seenSHA[latest.CommitSHA] {
-			shortSHA := latest.CommitSHA
-			if len(shortSHA) > 8 {
-				shortSHA = shortSHA[:8]
-			}
-			diffStat := ""
-			if sess.Config.Cwd != "" {
-				diffStat = gitDiffShortStat(sess.Config.Cwd, latest.CommitSHA)
-			}
-			items = append([]checkpointItem{{
-				id:        latest.ID,
-				turn:      latest.Turn,
-				commitSHA: latest.CommitSHA,
-				shortSHA:  shortSHA,
-				message:   latest.Message,
-				when:      latest.Timestamp.Format("15:04:05"),
-				diffStat:  diffStat,
-			}}, items...)
-		}
-	}
-
-	return items
-}
-
-func gitDiffShortStat(repoDir, commitSHA string) string {
-	if repoDir == "" || commitSHA == "" {
-		return ""
-	}
-	cmd := exec.Command("git", "diff", "--shortstat", commitSHA)
-	cmd.Dir = repoDir
-	out, err := cmd.Output()
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(out))
 }
 
 // View renders the full TUI.
@@ -1405,22 +1234,7 @@ func (m *model) isLocalRoute() bool {
 	if m.sess == nil {
 		return false
 	}
-	switch strings.ToLower(m.sess.Config.ExplicitProvider) {
-	case "ollama":
-		return true
-	case "cloud":
-		return false
-	}
-	active := strings.ToLower(m.activeModelName())
-	local := strings.ToLower(m.sess.Config.LocalModelName)
-	if local != "" && active == local {
-		return true
-	}
-	return strings.Contains(active, ":") ||
-		strings.HasPrefix(active, "gemma") ||
-		strings.HasPrefix(active, "llama") ||
-		strings.HasPrefix(active, "qwen") ||
-		strings.HasPrefix(active, "orbit-")
+	return m.sess.IsLocalRoute()
 }
 
 func (m *model) renderStatusBar(width, scrollEnd, totalLines int) string {
@@ -1610,15 +1424,15 @@ func (m *model) renderRewindPicker(width, height int) string {
 				prefix = "▶ "
 				lineStyle = lipStyle(ui.RolePrimary).Bold(true)
 			}
-			info := fmt.Sprintf("%s (Turn %d, %s)", cp.id, cp.turn, cp.shortSHA)
-			if cp.when != "" {
-				info += " • " + cp.when
+			info := fmt.Sprintf("%s (Turn %d, %s)", cp.ID, cp.Turn, cp.ShortSHA)
+			if cp.When != "" {
+				info += " • " + cp.When
 			}
-			if cp.message != "" {
-				info += " — " + cp.message
+			if cp.Message != "" {
+				info += " — " + cp.Message
 			}
-			if cp.diffStat != "" {
-				info += " [" + cp.diffStat + "]"
+			if cp.DiffStat != "" {
+				info += " [" + cp.DiffStat + "]"
 			}
 			sb.WriteString(lineStyle.Render(prefix+truncateRunes(info, innerW)) + "\n")
 		}
@@ -1638,7 +1452,7 @@ func (m *model) renderRewindPicker(width, height int) string {
 func (m *model) renderThemePicker(width, height int) string {
 	boxW := minInt(maxInt(44, width-4), 80)
 	innerW := boxW - 6
-	options := themePickerOptions()
+	options := slash.SupportedThemes()
 
 	var sb strings.Builder
 	sb.WriteString(lipStyle(ui.RoleBrand).Bold(true).Render("🎨 SELECT THEME") + "\n")
@@ -1670,18 +1484,10 @@ func (m *model) renderThemePicker(width, height int) string {
 }
 
 func (m *model) renderHelp(width int) string {
-	help := `Available commands & shortcuts:
-  /theme [name|auto] - Switch UI theme (dark, light, tokyo-night, catppuccin, high-contrast, auto)
-  /rewind            - Interactive checkpoint picker overlay
-  /undo              - Rollback last turn's file modifications
-  /swarm [on|off]    - Toggle split-pane subagent/swarm monitor panel
-  /session <name>    - Switch/resume a session
-  /usage             - Show session context & token budget
-  /clear             - Clear history
-  /help / F1         - Show/hide this help
-  /exit / /quit      - Leave chat
+	help := slash.HelpText() + `
 
 Navigation & input:
+  F1                                    - Show/hide this help
   PgUp/PgDn, Ctrl+U/Ctrl+D, Mouse Wheel - Scroll message viewport
   Tab                                   - Expand/collapse tool call cards
   Alt+Enter / Ctrl+J                    - Insert newline in input
@@ -1861,22 +1667,39 @@ var tuiCmd = &cobra.Command{
 
 		notifyChan := make(chan string, 10)
 
-		activeModelID := config.GetActiveModel()
-		if activeModelID != "" {
-			cloudModel = activeModelID
-		}
+		cfgDisk, _ := config.LoadConfig()
+		resolved := router.ResolveConfig(router.ConfigInput{
+			Config:          cfgDisk,
+			LocalFlag:       rootLocal,
+			RoutingMode:     rootRoutingMode,
+			ModelFlag:       rootModel,
+			LocalModel:      modelName,
+			CloudModel:      cloudModel,
+			LocalFastModel:  rootLocalFastModel,
+			LocalHeavyModel: rootLocalHeavyModel,
+			OpenAIBaseURL:   rootBaseURL,
+		})
+		modelName = resolved.LocalModel
+		cloudModel = resolved.CloudModel
 
 		opts := SessionOptions{
-			SessionName:    sessionName,
-			ActiveModel:    cloudModel,
-			LocalModelName: modelName,
-			CloudModelName: cloudModel,
-			OllamaBaseURL:  baseURL,
-			MCPServers:     mcpServers,
-			NotifyChan:     notifyChan,
-			AddDirs:        rootAddDirs,
-			Sandbox:        rootSandbox,
-			DryRun:         rootDryRun,
+			SessionName:      sessionName,
+			ActiveModel:      resolved.ActiveModel,
+			LocalModelName:   resolved.LocalModel,
+			CloudModelName:   resolved.CloudModel,
+			OllamaBaseURL:    baseURL,
+			ExplicitProvider: resolved.ExplicitProvider,
+			RoutingMode:      string(resolved.RoutingMode),
+			LocalFastModel:   resolved.LocalFastModel,
+			LocalHeavyModel:  resolved.LocalHeavyModel,
+			OpenAIBaseURL:    resolved.OpenAIBaseURL,
+			OpenAIAPIKey:     resolved.OpenAIAPIKey,
+			OpenAIModel:      resolved.OpenAIModel,
+			MCPServers:       mcpServers,
+			NotifyChan:       notifyChan,
+			AddDirs:          rootAddDirs,
+			Sandbox:          rootSandbox,
+			DryRun:           rootDryRun,
 		}
 
 		sess, cleanup, err := BuildEngineSession(ctx, opts)
@@ -1888,22 +1711,31 @@ var tuiCmd = &cobra.Command{
 
 		_ = sess.LoadSavedHistory()
 
-		ollama.EnsureOllama()
-		ollamaClient := ollama.NewClient(baseURL)
-		hasModel, _ := ollamaClient.HasModel(ctx, modelName)
-		daemon := updater.NewDaemon(ollamaClient, modelName)
-		daemon.Start()
-		defer daemon.Stop()
-
 		localModelStatus := ""
-		if hasModel {
-			localModelStatus = modelName
+		if opts.OpenAIBaseURL != "" {
+			if modelsList, lErr := sess.OpenAIClient.ListModels(ctx); lErr == nil && len(modelsList) > 0 {
+				localModelStatus = modelsList[0]
+			} else if opts.OpenAIModel != "" {
+				localModelStatus = opts.OpenAIModel
+			} else {
+				localModelStatus = opts.OpenAIBaseURL
+			}
+		} else {
+			ollama.EnsureOllama()
+			ollamaClient := ollama.NewClient(baseURL)
+			hasModel, _ := ollamaClient.HasModel(ctx, modelName)
+			daemon := updater.NewDaemon(ollamaClient, modelName)
+			daemon.Start()
+			defer daemon.Stop()
+			if hasModel {
+				localModelStatus = modelName
+			}
 		}
 
 		mcpConnected := len(sess.Config.MCPClients)
 		loadedSkills := sess.Config.LoadedSkills
 
-		ui.PrintStatusSummary(cloudModel, mcpConnected, len(loadedSkills), localModelStatus)
+		ui.PrintStatusSummary(resolved.DisplayModel(), mcpConnected, len(loadedSkills), localModelStatus)
 
 		if err := RunTUI(sess, ctx); err != nil {
 			fmt.Fprintf(os.Stderr, "%s\n", ui.PrintError(err))
