@@ -2,7 +2,7 @@
 ## Autonomous AI Engineering Agent Framework
 
 **Author**: Principal Systems Architect  
-**Target Codebase**: `A:\projects\microgravity`  
+**Target Codebase**: `<REPO_ROOT>`  
 **Base Systems**: Go 1.24 Core Agent Engine, Python Letta/Browser Adapters, Antigravity EventBus  
 **Roadmap Version**: 2.0.0 (Post-R1/R2/R3 Upgrade)  
 **Status**: Approved Strategic Engineering Blueprint  
@@ -343,7 +343,7 @@ curl http://localhost:8082/status
 
 ### 2. Verification of VS Code Extension
 ```bash
-cd A:\projects\microgravity\vscode-extension
+cd <REPO_ROOT>\vscode-extension
 npm install
 npm test
 npm run package
@@ -354,10 +354,10 @@ code --install-extension microgravity-agentic-ide-1.0.0.vsix
 ### 3. Verification of Swarm Mesh & EventBus
 ```bash
 # Verify Python EventBus client connectivity
-python A:\projects\microgravity\python\microgravity_mesh_client.py --demo
+python <REPO_ROOT>\python\microgravity_mesh_client.py --demo
 
 # Verify Go unit tests and swarm manager
-cd A:\projects\microgravity
+cd <REPO_ROOT>
 go test -v ./internal/swarm/...
 go test -v ./internal/events/...
 ```
@@ -365,7 +365,7 @@ go test -v ./internal/events/...
 ### 4. Verification of Letta Memory & Vector Search
 ```bash
 # Execute Letta memory unit tests
-python -m unittest A:\projects\microgravity\python\letta\test_mg_memory_letta.py
+python -m unittest <REPO_ROOT>\python\letta\test_mg_memory_letta.py
 
 # Verify Go bridge
 go test -v ./internal/tools/ -run TestLettaMemory
@@ -373,6 +373,6 @@ go test -v ./internal/tools/ -run TestLettaMemory
 
 ### 5. Full Repository Regression Suite
 ```bash
-cd A:\projects\microgravity
+cd <REPO_ROOT>
 go test ./...
 ```

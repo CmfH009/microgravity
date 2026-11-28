@@ -1,7 +1,7 @@
 # Microgravity Letta Memory & Browser-Use Architecture Specification
 
 **Specification Version**: 1.0.0  
-**Target Systems**: `A:\projects\microgravity\` (`mg`), `A:\upstream\letta\`, `A:\upstream\browser-use\`  
+**Target Systems**: `<REPO_ROOT>\` (`mg`), `A:\upstream\letta\`, `A:\upstream\browser-use\`  
 **Status**: Implemented & Empirically Verified  
 
 ---

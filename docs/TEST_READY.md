@@ -2,7 +2,7 @@
 
 ## Status: READY & 100% PASSING
 
-The End-to-End (E2E) opaque-box test suite for Microgravity (`mg`) is fully authored, integrated, and verified against `A:\projects\microgravity`.
+The End-to-End (E2E) opaque-box test suite for Microgravity (`mg`) is fully authored, integrated, and verified against `<REPO_ROOT>`.
 
 ## Runner Commands
 

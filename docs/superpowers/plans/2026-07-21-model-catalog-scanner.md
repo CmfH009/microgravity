@@ -252,7 +252,7 @@ Expected: PASS
 
 - [ ] **Step 3: Build & Install updated `mg.exe`**
 
-Run: `go build -o C:\Users\purav\go\bin\mg.exe main.go`
+Run: `go build -o <USER_HOME>\go\bin\mg.exe main.go`
 Expected: Build succeeds
 
 - [ ] **Step 4: Commit**
